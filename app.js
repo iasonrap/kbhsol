@@ -1,90 +1,109 @@
 // --- Config ---------------------------------------------------------------
 
-// Rough bounding box for Nordvest, Copenhagen (south, west, north, east)
-const BBOX = { south: 55.696, west: 12.515, north: 55.722, east: 12.565 };
-const CENTER = [ (BBOX.west + BBOX.east) / 2, (BBOX.south + BBOX.north) / 2 ];
+// Rough bounding boxes (south, west, north, east) for each selectable area of Copenhagen.
+const AREAS = {
+  'vesterbro-frederiksberg': {
+    label: 'Vesterbro / Frederiksberg',
+    bbox: { south: 55.665, west: 12.500, north: 55.688, east: 12.575 }
+  },
+  'nordvest-bispebjerg': {
+    label: 'Nordvest / Bispebjerg',
+    bbox: { south: 55.700, west: 12.515, north: 55.735, east: 12.575 }
+  },
+  'norrebro': {
+    label: 'Nørrebro',
+    bbox: { south: 55.685, west: 12.530, north: 55.703, east: 12.575 }
+  },
+  'osterbro-nordhavn': {
+    label: 'Østerbro / Nordhavn',
+    bbox: { south: 55.695, west: 12.575, north: 55.735, east: 12.615 }
+  },
+  'christiania-amagerbro': {
+    label: 'Christiania / Amagerbro',
+    bbox: { south: 55.660, west: 12.585, north: 55.685, east: 12.620 }
+  }
+};
 
-const OVERPASS_URLS = [
-  'https://overpass-api.de/api/interpreter',
-  'https://overpass.kumi.systems/api/interpreter'
-];
-const DMI_OBS_URL = 'https://opendataapi.dmi.dk/v2/metObs/collections/observation/items';
+function areaCenter(bbox) {
+  return [(bbox.west + bbox.east) / 2, (bbox.south + bbox.north) / 2];
+}
 
 const SUNNY_CLOUD_THRESHOLD = 60; // cloud_cover value (0-100 scale) below which we consider it "sunny enough"
 const SHADOW_RAY_METERS = 200;    // how far to search for occluding buildings
 
 const panel = document.getElementById('panel');
 
+// --- Tabs (Map / About) ------------------------------------------------
+
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById('map-view').hidden = tab.dataset.view !== 'map';
+    document.getElementById('about-view').hidden = tab.dataset.view !== 'about';
+  });
+});
+
+const aboutView = document.getElementById('about-view');
+const scrollHint = document.getElementById('scroll-hint');
+
+scrollHint.addEventListener('click', () => {
+  aboutView.scrollBy({ top: aboutView.clientHeight * 0.85, behavior: 'smooth' });
+});
+
+function updateScrollHint() {
+  const nearBottom = aboutView.scrollTop + aboutView.clientHeight >= aboutView.scrollHeight - 40;
+  scrollHint.classList.toggle('hidden', nearBottom);
+}
+aboutView.addEventListener('scroll', updateScrollHint);
+
+let readmeLoaded = false;
+document.querySelector('[data-view="about"]').addEventListener('click', async () => {
+  if (readmeLoaded) return;
+  readmeLoaded = true;
+  const content = document.getElementById('about-content');
+  try {
+    const res = await fetch('readme.md');
+    const markdown = await res.text();
+    content.innerHTML = marked.parse(markdown);
+  } catch (err) {
+    content.textContent = 'Could not load readme.md.';
+    readmeLoaded = false;
+  }
+  updateScrollHint();
+});
+
 // --- Overpass fetch ---------------------------------------------------------
 
-function bboxStr() {
-  return `${BBOX.south},${BBOX.west},${BBOX.north},${BBOX.east}`;
+function bboxStr(bbox) {
+  return `${bbox.south},${bbox.west},${bbox.north},${bbox.east}`;
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-async function fetchOverpass(query, retries = 2) {
-  let lastErr;
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    for (const url of OVERPASS_URLS) {
-      try {
-        const res = await fetch(url, { method: 'POST', body: query });
-        if (!res.ok) throw new Error(`Overpass ${url} responded ${res.status}`);
-        return await res.json();
-      } catch (err) {
-        console.warn('Overpass endpoint failed', url, err);
-        lastErr = err;
-      }
-    }
-    if (attempt < retries) await sleep(2000 * (attempt + 1)); // backoff before retrying all mirrors again
-  }
-  throw lastErr;
+// Overpass and DMI requests go through our own tiny local proxy (server.py),
+// which caches responses to disk under data/ for 20 minutes — so clicking
+// areas on/off repeatedly doesn't re-hit the public APIs each time.
+async function fetchOverpass(query) {
+  const res = await fetch('/api/overpass', { method: 'POST', body: query });
+  if (!res.ok) throw new Error(`Overpass proxy responded ${res.status}`);
+  return res.json();
 }
 
-const BUILDINGS_CACHE_KEY = 'followthesun_buildings_v1';
-const BUILDINGS_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 1 day — building footprints rarely change
-
-function loadCachedBuildings() {
-  try {
-    const raw = localStorage.getItem(BUILDINGS_CACHE_KEY);
-    if (!raw) return null;
-    const { savedAt, data } = JSON.parse(raw);
-    if (Date.now() - savedAt > BUILDINGS_CACHE_MAX_AGE_MS) return null;
-    return data;
-  } catch {
-    return null;
-  }
-}
-
-function saveCachedBuildings(data) {
-  try {
-    localStorage.setItem(BUILDINGS_CACHE_KEY, JSON.stringify({ savedAt: Date.now(), data }));
-  } catch {
-    // ignore quota errors, caching is a best-effort optimization
-  }
-}
-
-async function fetchBuildings() {
-  const cached = loadCachedBuildings();
-  if (cached) return cached;
-
+async function fetchBuildings(areaId, bbox) {
   const query = `
     [out:json][timeout:60];
-    way["building"](${bboxStr()});
+    way["building"](${bboxStr(bbox)});
     out geom;
   `;
   const data = await fetchOverpass(query);
-  const geojson = overpassBuildingsToGeoJSON(data);
-  saveCachedBuildings(geojson);
-  return geojson;
+  return overpassBuildingsToGeoJSON(data);
 }
 
-async function fetchVenues() {
+async function fetchVenues(bbox) {
   const query = `
     [out:json][timeout:25];
     (
-      node["amenity"~"^(cafe|bar|restaurant|pub)$"](${bboxStr()});
-      way["amenity"~"^(cafe|bar|restaurant|pub)$"](${bboxStr()});
+      node["amenity"~"^(cafe|bar|restaurant|pub)$"](${bboxStr(bbox)});
+      way["amenity"~"^(cafe|bar|restaurant|pub)$"](${bboxStr(bbox)});
     );
     out center;
   `;
@@ -144,10 +163,10 @@ function overpassVenuesToGeoJSON(data) {
 async function fetchCloudCover(lat, lon) {
   const d = 0.2;
   const bbox = `${lon - d},${lat - d},${lon + d},${lat + d}`;
-  const url = `${DMI_OBS_URL}?parameterId=cloud_cover&bbox=${bbox}&limit=20&sortorder=observed,DESC`;
+  const url = `/api/weather?bbox=${encodeURIComponent(bbox)}`;
   try {
     const res = await fetch(url);
-    if (!res.ok) throw new Error(`DMI request failed: ${res.status}`);
+    if (!res.ok) throw new Error(`DMI proxy responded ${res.status}`);
     const data = await res.json();
     if (!data.features || !data.features.length) return null;
 
@@ -289,31 +308,210 @@ function isVenueShadowed(venueCoord, buildings, bearingDeg, altitudeRad) {
 
 // --- Main -------------------------------------------------------------------
 
+const COPENHAGEN_CENTER = [12.57, 55.685];
+
 const map = new maplibregl.Map({
   container: 'map',
   style: 'https://tiles.openfreemap.org/styles/liberty',
-  center: CENTER,
-  zoom: 15.5,
-  pitch: 45
+  center: COPENHAGEN_CENTER,
+  zoom: 11.5,
+  pitch: 0
 });
 
 map.addControl(new maplibregl.NavigationControl());
 
-map.on('load', async () => {
-  panel.textContent = 'Fetching buildings & venues from OpenStreetMap…';
+// --- Loading overlay --------------------------------------------------
+
+const idlePrompt = document.getElementById('idle-prompt');
+const loadingOverlay = document.getElementById('loading-overlay');
+const loadingText = document.getElementById('loading-text');
+
+function resetLoadingSteps() {
+  loadingOverlay.innerHTML = `
+    <div class="sun-loader"><div class="rays"></div><div class="core"></div></div>
+    <div id="loading-text">Waking up the sun…</div>
+    <div id="loading-steps">
+      <span data-step="venues"></span>
+      <span data-step="buildings"></span>
+      <span data-step="weather"></span>
+      <span data-step="shadows"></span>
+    </div>
+  `;
+  loadingOverlay.classList.remove('fade-out');
+  loadingOverlay.hidden = false;
+}
+
+function markStepDone(step) {
+  const dot = loadingOverlay.querySelector(`[data-step="${step}"]`);
+  if (dot) dot.classList.add('done');
+}
+
+function setLoadingText(text) {
+  const el = document.getElementById('loading-text');
+  if (el) el.textContent = text;
+}
+
+function hideLoadingOverlay() {
+  loadingOverlay.classList.add('fade-out');
+  setTimeout(() => { loadingOverlay.hidden = true; }, 500);
+  panel.hidden = false;
+}
+
+function showLoadingError(message) {
+  loadingOverlay.innerHTML = `
+    <div class="sun-loader"><div class="core" style="animation:none;filter:grayscale(1);opacity:0.6"></div></div>
+    <div class="error-box">${message}</div>
+    <button class="retry" onclick="location.reload()">Retry</button>
+  `;
+}
+
+const STATE_LABELS = {
+  'sun': '☀️ In the sun',
+  'building-shade': '🏢 In shade (blocked by a building)',
+  'cloudy': '☁️ Shaded (too cloudy for direct sun)',
+  'night': '🌙 Shaded (sun is down)'
+};
+
+let iconsRegistered = false;
+const popup = new maplibregl.Popup({ closeButton: false, offset: 10 });
+
+// Each toggled-on area gets its own source/layer set, keyed by areaId, so
+// areas can be independently added and removed without touching each other.
+const loadedAreas = {}; // areaId -> { venues, counts }
+let pendingLoads = 0;
+
+function addAreaLayers(areaId, buildings, venues) {
+  if (!iconsRegistered) {
+    registerVenueIcons(map);
+    iconsRegistered = true;
+  }
+
+  map.addSource(`buildings-${areaId}`, { type: 'geojson', data: buildings });
+  map.addLayer({
+    id: `buildings-3d-${areaId}`,
+    type: 'fill-extrusion',
+    source: `buildings-${areaId}`,
+    paint: {
+      'fill-extrusion-color': '#888',
+      'fill-extrusion-height': ['get', 'height'],
+      'fill-extrusion-opacity': 0.6
+    }
+  });
+
+  map.addSource(`venues-${areaId}`, { type: 'geojson', data: venues });
+  map.addLayer({
+    id: `venues-dots-${areaId}`,
+    type: 'circle',
+    source: `venues-${areaId}`,
+    paint: {
+      'circle-radius': 10,
+      'circle-color': [
+        'match', ['get', 'state'],
+        'sun', '#ffd166',
+        'building-shade', '#4a5568',
+        'cloudy', '#cbd5e0',
+        'night', '#1a2a6c',
+        '#4a5568'
+      ],
+      'circle-stroke-width': 1.5,
+      'circle-stroke-color': '#1a1a1a'
+    }
+  });
+  map.addLayer({
+    id: `venues-icons-${areaId}`,
+    type: 'symbol',
+    source: `venues-${areaId}`,
+    layout: {
+      'icon-image': ['get', 'icon'],
+      'icon-size': 0.7,
+      'icon-allow-overlap': true
+    }
+  });
+
+  map.on('mouseenter', `venues-dots-${areaId}`, (e) => {
+    map.getCanvas().style.cursor = 'pointer';
+    const f = e.features[0];
+    popup.setLngLat(f.geometry.coordinates)
+      .setHTML(`<b>${f.properties.name}</b><br>${f.properties.amenity}<br>${STATE_LABELS[f.properties.state]}`)
+      .addTo(map);
+  });
+  map.on('mouseleave', `venues-dots-${areaId}`, () => {
+    map.getCanvas().style.cursor = '';
+    popup.remove();
+  });
+}
+
+function removeAreaLayers(areaId) {
+  for (const id of [`venues-icons-${areaId}`, `venues-dots-${areaId}`, `buildings-3d-${areaId}`]) {
+    if (map.getLayer(id)) map.removeLayer(id);
+  }
+  for (const id of [`venues-${areaId}`, `buildings-${areaId}`]) {
+    if (map.getSource(id)) map.removeSource(id);
+  }
+}
+
+function renderPanel() {
+  const entries = Object.values(loadedAreas);
+  if (!entries.length) {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+
+  const total = { sun: 0, 'building-shade': 0, cloudy: 0, night: 0 };
+  const areaRows = entries.map(({ area, sun, cloudCover, sunAvailable, sunIsUp, counts }) => {
+    for (const k in counts) total[k] += counts[k];
+    return `
+      <div class="panel-area">
+        <b>${area.label}</b> — ${sun.time.toLocaleTimeString('da-DK')}<br>
+        Sun altitude: ${sun.altitudeDeg.toFixed(1)}° · Cloud cover: ${cloudCover == null ? 'unknown' : cloudCover.toFixed(0) + '%'}<br>
+        ${sunAvailable ? 'Sun is out' : (sunIsUp ? 'Too cloudy' : 'Sun is down')}
+      </div>`;
+  }).join('');
+
+  panel.innerHTML = `
+    ${areaRows}
+    <div id="legend">
+      <span class="dot sun"></span>In sun (${total.sun})<br>
+      <span class="dot shade"></span>Building shade (${total['building-shade']})<br>
+      <span class="dot cloudy"></span>Cloudy (${total.cloudy})<br>
+      <span class="dot night"></span>Night (${total.night})
+    </div>
+  `;
+}
+
+async function loadArea(areaId) {
+  const area = AREAS[areaId];
+  const bbox = area.bbox;
+  const center = areaCenter(bbox);
+
+  idlePrompt.hidden = true;
+  if (pendingLoads === 0) resetLoadingSteps();
+  pendingLoads++;
+
+  map.fitBounds([[bbox.west, bbox.south], [bbox.east, bbox.north]], { padding: 40, pitch: 45, duration: 800 });
+  setLoadingText(`Finding cafés, bars & restaurants in ${area.label}…`);
 
   let buildings, venues;
   try {
-    [buildings, venues] = await Promise.all([fetchBuildings(), fetchVenues()]);
+    const venuesPromise = fetchVenues(bbox).then(v => { markStepDone('venues'); return v; });
+    const buildingsPromise = fetchBuildings(areaId, bbox).then(b => { markStepDone('buildings'); return b; });
+    setLoadingText('Fetching venues & building shapes from OpenStreetMap…');
+    [buildings, venues] = await Promise.all([buildingsPromise, venuesPromise]);
   } catch (err) {
     console.error('Failed to load OSM data', err);
-    panel.innerHTML = 'Could not load map data from OpenStreetMap (Overpass API may be busy). <br><button onclick="location.reload()">Retry</button>';
+    pendingLoads--;
+    document.querySelector(`[data-area="${areaId}"]`).classList.remove('active');
+    if (pendingLoads === 0) showLoadingError('Could not load map data from OpenStreetMap — the Overpass API may be busy.');
     return;
   }
 
-  panel.textContent = 'Fetching cloud cover from DMI…';
-  const cloudCover = await fetchCloudCover(CENTER[1], CENTER[0]);
-  const sun = getSunInfo(CENTER[1], CENTER[0]);
+  setLoadingText('Checking the sky over Copenhagen…');
+  const cloudCover = await fetchCloudCover(center[1], center[0]);
+  markStepDone('weather');
+  const sun = getSunInfo(center[1], center[0]);
+
+  setLoadingText('Tracing shadows…');
 
   const sunIsUp = sun.altitudeDeg > 0;
   const skyIsClearEnough = cloudCover == null ? true : cloudCover <= SUNNY_CLOUD_THRESHOLD;
@@ -332,84 +530,36 @@ map.on('load', async () => {
     }
     f.properties.state = state;
   }
+  markStepDone('shadows');
 
-  map.addSource('buildings', { type: 'geojson', data: buildings });
-  map.addLayer({
-    id: 'buildings-3d',
-    type: 'fill-extrusion',
-    source: 'buildings',
-    paint: {
-      'fill-extrusion-color': '#888',
-      'fill-extrusion-height': ['get', 'height'],
-      'fill-extrusion-opacity': 0.6
-    }
-  });
-
-  registerVenueIcons(map);
-
-  map.addSource('venues', { type: 'geojson', data: venues });
-  map.addLayer({
-    id: 'venues-dots',
-    type: 'circle',
-    source: 'venues',
-    paint: {
-      'circle-radius': 10,
-      'circle-color': [
-        'match', ['get', 'state'],
-        'sun', '#ffd166',
-        'building-shade', '#4a5568',
-        'cloudy', '#cbd5e0',
-        'night', '#1a2a6c',
-        '#4a5568'
-      ],
-      'circle-stroke-width': 1.5,
-      'circle-stroke-color': '#1a1a1a'
-    }
-  });
-  map.addLayer({
-    id: 'venues-icons',
-    type: 'symbol',
-    source: 'venues',
-    layout: {
-      'icon-image': ['get', 'icon'],
-      'icon-size': 0.7,
-      'icon-allow-overlap': true
-    }
-  });
-
-  const STATE_LABELS = {
-    'sun': '☀️ In the sun',
-    'building-shade': '🏢 In shade (blocked by a building)',
-    'cloudy': '☁️ Shaded (too cloudy for direct sun)',
-    'night': '🌙 Shaded (sun is down)'
-  };
-
-  const popup = new maplibregl.Popup({ closeButton: false, offset: 10 });
-  map.on('mouseenter', 'venues-dots', (e) => {
-    map.getCanvas().style.cursor = 'pointer';
-    const f = e.features[0];
-    popup.setLngLat(f.geometry.coordinates)
-      .setHTML(`<b>${f.properties.name}</b><br>${f.properties.amenity}<br>${STATE_LABELS[f.properties.state]}`)
-      .addTo(map);
-  });
-  map.on('mouseleave', 'venues-dots', () => {
-    map.getCanvas().style.cursor = '';
-    popup.remove();
-  });
+  addAreaLayers(areaId, buildings, venues);
 
   const counts = { sun: 0, 'building-shade': 0, cloudy: 0, night: 0 };
   for (const f of venues.features) counts[f.properties.state]++;
 
-  panel.innerHTML = `
-    <b>${sun.time.toLocaleTimeString('da-DK')}</b><br>
-    Sun altitude: ${sun.altitudeDeg.toFixed(1)}°<br>
-    Cloud cover: ${cloudCover == null ? 'unknown' : cloudCover.toFixed(0) + '%'}<br>
-    ${sunAvailable ? 'Sun is out' : (sunIsUp ? 'Too cloudy' : 'Sun is down')}<br>
-    <div id="legend">
-      <span class="dot sun"></span>In sun (${counts.sun})<br>
-      <span class="dot shade"></span>Building shade (${counts['building-shade']})<br>
-      <span class="dot cloudy"></span>Cloudy (${counts.cloudy})<br>
-      <span class="dot night"></span>Night (${counts.night})
-    </div>
-  `;
+  loadedAreas[areaId] = { area, sun, cloudCover, sunAvailable, sunIsUp, counts };
+  renderPanel();
+
+  pendingLoads--;
+  if (pendingLoads === 0) hideLoadingOverlay();
+}
+
+function unloadArea(areaId) {
+  removeAreaLayers(areaId);
+  delete loadedAreas[areaId];
+  renderPanel();
+  if (!Object.keys(loadedAreas).length && pendingLoads === 0) idlePrompt.hidden = false;
+}
+
+document.querySelectorAll('.area-box').forEach(box => {
+  box.addEventListener('click', () => {
+    const areaId = box.dataset.area;
+    const turningOn = !box.classList.contains('active');
+    box.classList.toggle('active', turningOn);
+    if (turningOn) {
+      loadArea(areaId);
+    } else {
+      unloadArea(areaId);
+    }
+  });
 });

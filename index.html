@@ -6,8 +6,57 @@
 <title>Follow The Sun — Nordvest</title>
 <link href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css" rel="stylesheet" />
 <style>
-  html, body { margin: 0; height: 100%; font-family: -apple-system, sans-serif; }
-  #map { position: absolute; top: 0; bottom: 0; width: 100%; }
+  html, body {
+    margin: 0; height: 100%; font-family: -apple-system, sans-serif;
+    display: flex; flex-direction: column;
+  }
+
+  header {
+    flex: 0 0 auto; display: flex; align-items: center; gap: 4px;
+    background: #14161a; padding: 0 12px; height: 48px;
+  }
+  header h1 {
+    font-size: 15px; color: #ffd166; margin: 0 16px 0 0; white-space: nowrap;
+  }
+  .tab {
+    background: none; border: none; color: #aaa; font-size: 14px;
+    padding: 12px 14px; cursor: pointer; border-bottom: 2px solid transparent;
+  }
+  .tab:hover { color: #fff; }
+  .tab.active { color: #ffd166; border-bottom-color: #ffd166; }
+
+  #area-bar {
+    flex: 0 0 auto; display: flex; gap: 10px; flex-wrap: wrap;
+    background: #1c1f26; padding: 10px 12px; border-bottom: 1px solid #2a2e37;
+  }
+  .area-box {
+    background: #262a33; border: 1.5px solid #363b46; color: #ddd;
+    font-size: 13px; padding: 10px 16px; border-radius: 8px; cursor: pointer;
+    transition: border-color 0.2s, background 0.2s, color 0.2s;
+  }
+  .area-box:hover { border-color: #ffd166; color: #fff; }
+  .area-box.active {
+    background: #3a3110; border-color: #ffd166; color: #ffd166; font-weight: 600;
+  }
+
+  main { flex: 1 1 auto; position: relative; min-height: 0; }
+  #map-view, #about-view { position: absolute; inset: 0; }
+  #about-view {
+    overflow-y: auto; background: #fff;
+    scrollbar-width: thin; scrollbar-color: #ffd166 #f0f2f5;
+  }
+  #about-view::-webkit-scrollbar { width: 12px; }
+  #about-view::-webkit-scrollbar-track { background: #f0f2f5; }
+  #about-view::-webkit-scrollbar-thumb {
+    background: linear-gradient(#ffd166, #e0a92e);
+    border-radius: 8px; border: 3px solid #f0f2f5;
+  }
+  #about-view::-webkit-scrollbar-thumb:hover {
+    background: linear-gradient(#ffdd85, #ffd166);
+  }
+  [hidden] { display: none !important; }
+
+  #map { position: absolute; inset: 0; }
   #panel {
     position: absolute; top: 12px; left: 12px; z-index: 1;
     background: rgba(20,20,20,0.85); color: #fff; padding: 12px 16px;
@@ -15,20 +64,190 @@
   }
   #panel b { color: #ffd166; }
   #legend { margin-top: 8px; }
+  .panel-area { padding-bottom: 8px; margin-bottom: 8px; border-bottom: 1px solid rgba(255,255,255,0.15); }
+  .panel-area:last-of-type { border-bottom: none; margin-bottom: 0; }
+  #panel { max-height: 70vh; overflow-y: auto; }
   .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
   .sun { background: #ffd166; }
   .shade { background: #4a5568; }
   .cloudy { background: #cbd5e0; }
   .night { background: #1a2a6c; }
+
+  #about-content {
+    max-width: 720px; margin: 0 auto; padding: 48px 24px 80px;
+    line-height: 1.7; color: #24292f; font-size: 15.5px;
+  }
+  #about-content h1 {
+    font-size: 30px; margin: 0 0 8px; color: #14161a;
+    border-bottom: 3px solid #ffd166; padding-bottom: 14px;
+  }
+  #about-content h1 + p {
+    font-size: 17px; color: #57606a; margin-top: 16px;
+  }
+  #about-content h2 {
+    font-size: 20px; color: #14161a; margin: 40px 0 12px;
+    padding-left: 12px; border-left: 4px solid #ffd166;
+  }
+  #about-content p { margin: 12px 0; }
+  #about-content ul { padding-left: 22px; }
+  #about-content li { margin: 10px 0; }
+  #about-content li::marker { color: #ffd166; }
+  #about-content strong { color: #14161a; }
+  #about-content code {
+    background: #f0f2f5; padding: 2px 6px; border-radius: 4px;
+    font-size: 0.88em; font-family: 'SF Mono', Menlo, monospace; color: #b8860b;
+  }
+  #about-content pre {
+    background: #14161a; color: #eee; padding: 16px; border-radius: 8px;
+    overflow-x: auto;
+  }
+  #about-content pre code { background: none; padding: 0; color: inherit; }
+  #about-content a { color: #b8860b; text-decoration: none; }
+  #about-content a:hover { text-decoration: underline; }
+  #about-content hr { border: none; border-top: 1px solid #e1e4e8; margin: 32px 0; }
+
+  #scroll-hint {
+    position: absolute; bottom: 24px; left: 50%; transform: translateX(-50%);
+    width: 44px; height: 44px; border-radius: 50%; border: none;
+    background: #ffd166; color: #14161a; font-size: 18px;
+    cursor: pointer; box-shadow: 0 4px 14px rgba(0,0,0,0.25);
+    animation: bob 1.6s ease-in-out infinite;
+    transition: opacity 0.3s;
+  }
+  #scroll-hint:hover { background: #ffdd85; }
+  #scroll-hint.hidden { opacity: 0; pointer-events: none; }
+  @keyframes bob {
+    0%, 100% { transform: translateX(-50%) translateY(0); }
+    50% { transform: translateX(-50%) translateY(8px); }
+  }
+
+  #loading-overlay {
+    position: absolute; inset: 0; z-index: 5;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 20px; background: radial-gradient(circle at 50% 40%, #2a2f3a, #14161a 70%);
+    transition: opacity 0.5s ease;
+  }
+  #loading-overlay.fade-out { opacity: 0; pointer-events: none; }
+  #loading-overlay[hidden] { display: none; }
+
+  #idle-prompt {
+    position: absolute; inset: 0; z-index: 4;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 10px; background: rgba(20,22,26,0.55); color: #fff; text-align: center;
+  }
+  #idle-prompt .icon { font-size: 34px; }
+  #idle-prompt p { margin: 0; font-size: 15px; color: #eee; }
+  #idle-prompt span { font-size: 13px; color: #aaa; }
+
+  .sun-loader {
+    position: relative; width: 88px; height: 88px;
+  }
+  .sun-loader .core {
+    position: absolute; inset: 22px; border-radius: 50%;
+    background: radial-gradient(circle at 35% 35%, #fff2c4, #ffd166 60%, #e0a92e);
+    box-shadow: 0 0 30px 6px rgba(255, 209, 102, 0.55);
+    animation: pulse 1.8s ease-in-out infinite;
+  }
+  .sun-loader .rays {
+    position: absolute; inset: 0;
+    animation: spin 6s linear infinite;
+  }
+  .sun-loader .rays::before, .sun-loader .rays::after {
+    content: ''; position: absolute; inset: 0;
+    background:
+      linear-gradient(#ffd166, transparent 30%) top center / 4px 20px no-repeat,
+      linear-gradient(#ffd166, transparent 30%) bottom center / 4px 20px no-repeat,
+      linear-gradient(90deg, #ffd166, transparent 30%) left center / 20px 4px no-repeat,
+      linear-gradient(90deg, #ffd166, transparent 30%) right center / 20px 4px no-repeat;
+    opacity: 0.8;
+  }
+  .sun-loader .rays::after { transform: rotate(45deg); }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes pulse {
+    0%, 100% { transform: scale(1); }
+    50% { transform: scale(1.12); }
+  }
+
+  #loading-text {
+    color: #fff; font-size: 14px; min-height: 20px; text-align: center;
+  }
+  #loading-steps {
+    display: flex; gap: 8px;
+  }
+  #loading-steps span {
+    width: 7px; height: 7px; border-radius: 50%; background: #444;
+    transition: background 0.3s;
+  }
+  #loading-steps span.done { background: #ffd166; }
+
+  #loading-overlay .error-box {
+    color: #ffb4b4; font-size: 13px; text-align: center; max-width: 280px;
+  }
+  #loading-overlay button.retry {
+    background: #ffd166; border: none; color: #14161a; font-size: 13px;
+    padding: 8px 18px; border-radius: 6px; cursor: pointer; margin-top: 8px;
+  }
+  #loading-overlay button.retry:hover { background: #ffdd85; }
+
+  footer {
+    flex: 0 0 auto; display: flex; justify-content: space-between; align-items: center;
+    background: #14161a; color: #aaa; font-size: 12px; padding: 10px 16px;
+  }
+  footer a { color: #ffd166; text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
 </style>
 </head>
 <body>
-<div id="panel">Loading sun &amp; weather data…</div>
-<div id="map"></div>
+
+<header>
+  <h1>Follow The Sun</h1>
+  <button class="tab active" data-view="map">Map</button>
+  <button class="tab" data-view="about">About</button>
+</header>
+
+<div id="area-bar">
+  <button class="area-box" data-area="vesterbro-frederiksberg">Vesterbro / Frederiksberg</button>
+  <button class="area-box" data-area="nordvest-bispebjerg">Nordvest / Bispebjerg</button>
+  <button class="area-box" data-area="norrebro">Nørrebro</button>
+  <button class="area-box" data-area="osterbro-nordhavn">Østerbro / Nordhavn</button>
+  <button class="area-box" data-area="christiania-amagerbro">Christiania / Amagerbro</button>
+</div>
+
+<main>
+  <div id="map-view">
+    <div id="panel" hidden></div>
+    <div id="map"></div>
+    <div id="idle-prompt">
+      <div class="icon">☀️</div>
+      <p>Pick an area above to see who's in the sun right now</p>
+      <span>Venues, buildings and weather load only for the area you choose</span>
+    </div>
+    <div id="loading-overlay" hidden>
+      <div class="sun-loader"><div class="rays"></div><div class="core"></div></div>
+      <div id="loading-text">Waking up the sun…</div>
+      <div id="loading-steps">
+        <span data-step="venues"></span>
+        <span data-step="buildings"></span>
+        <span data-step="weather"></span>
+        <span data-step="shadows"></span>
+      </div>
+    </div>
+  </div>
+  <div id="about-view" hidden>
+    <div id="about-content">Loading…</div>
+    <button id="scroll-hint" aria-label="Scroll down">▾</button>
+  </div>
+</main>
+
+<footer>
+  <a href="https://github.com/iasonrap" target="_blank" rel="noopener">github.com/iasonrap</a>
+  <span>Built with Claude</span>
+</footer>
 
 <script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
 <script src="https://unpkg.com/@turf/turf@6/turf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/suncalc@1.9.0/suncalc.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

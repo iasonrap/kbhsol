@@ -39,23 +39,88 @@ document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
     tab.classList.add('active');
-    document.getElementById('map-view').hidden = tab.dataset.view !== 'map';
-    document.getElementById('about-view').hidden = tab.dataset.view !== 'about';
+    const isMap = tab.dataset.view === 'map';
+    document.getElementById('map-view').hidden = !isMap;
+    document.getElementById('about-view').hidden = isMap;
+    document.getElementById('area-bar').hidden = !isMap;
   });
 });
 
 const aboutView = document.getElementById('about-view');
-const scrollHint = document.getElementById('scroll-hint');
+const toc = document.getElementById('toc');
 
-scrollHint.addEventListener('click', () => {
-  aboutView.scrollBy({ top: aboutView.clientHeight * 0.85, behavior: 'smooth' });
-});
+// Groups the flat markdown output into one full-height <section class="chapter">
+// per h2 (plus an intro chapter for the h1 + opening paragraph), so each
+// chapter can snap-scroll into view and fade in/out like a slide.
+function groupIntoChapters(content) {
+  const nodes = Array.from(content.childNodes);
+  content.innerHTML = '';
 
-function updateScrollHint() {
-  const nearBottom = aboutView.scrollTop + aboutView.clientHeight >= aboutView.scrollHeight - 40;
-  scrollHint.classList.toggle('hidden', nearBottom);
+  let section = document.createElement('section');
+  section.className = 'chapter chapter-intro';
+  content.appendChild(section);
+
+  for (const node of nodes) {
+    if (node.nodeType === 1 && node.tagName === 'H2') {
+      section = document.createElement('section');
+      section.className = 'chapter';
+      content.appendChild(section);
+    }
+    section.appendChild(node);
+  }
 }
-aboutView.addEventListener('scroll', updateScrollHint);
+
+function sizeChapters() {
+  document.querySelectorAll('.chapter').forEach(ch => {
+    ch.style.minHeight = `${aboutView.clientHeight}px`;
+  });
+}
+
+function buildToc() {
+  const content = document.getElementById('about-content');
+  const headings = content.querySelectorAll('h2');
+  toc.innerHTML = '';
+
+  headings.forEach((h, i) => {
+    h.id = `section-${i}`;
+
+    let snippetSource = h.nextElementSibling;
+    while (snippetSource && !['P', 'UL'].includes(snippetSource.tagName)) {
+      snippetSource = snippetSource.nextElementSibling;
+    }
+    const snippetText = snippetSource ? snippetSource.textContent.trim() : '';
+    const snippet = snippetText.length > 100 ? snippetText.slice(0, 100) + '…' : snippetText;
+
+    const item = document.createElement('button');
+    item.className = 'toc-item';
+    item.innerHTML = `<span class="toc-title">${h.textContent}</span><span class="toc-snippet">${snippet}</span>`;
+    item.addEventListener('click', () => {
+      h.closest('.chapter').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+    toc.appendChild(item);
+  });
+}
+
+function observeChapters() {
+  const chapters = Array.from(document.querySelectorAll('.chapter'));
+  const items = toc.querySelectorAll('.toc-item');
+
+  const observer = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      entry.target.classList.toggle('visible', entry.isIntersecting);
+      if (entry.isIntersecting) {
+        const chapterIndex = chapters.filter(c => !c.classList.contains('chapter-intro')).indexOf(entry.target);
+        items.forEach((item, i) => item.classList.toggle('active', i === chapterIndex));
+      }
+    }
+  }, { root: aboutView, threshold: 0.55 });
+
+  chapters.forEach(ch => observer.observe(ch));
+}
+
+window.addEventListener('resize', () => {
+  if (!document.getElementById('about-view').hidden) sizeChapters();
+});
 
 let readmeLoaded = false;
 document.querySelector('[data-view="about"]').addEventListener('click', async () => {
@@ -66,11 +131,14 @@ document.querySelector('[data-view="about"]').addEventListener('click', async ()
     const res = await fetch('readme.md');
     const markdown = await res.text();
     content.innerHTML = marked.parse(markdown);
+    groupIntoChapters(content);
+    sizeChapters();
+    buildToc();
+    observeChapters();
   } catch (err) {
     content.textContent = 'Could not load readme.md.';
     readmeLoaded = false;
   }
-  updateScrollHint();
 });
 
 // --- Overpass fetch ---------------------------------------------------------

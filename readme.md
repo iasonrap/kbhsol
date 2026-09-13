@@ -63,7 +63,13 @@ layer entirely.
 
 - The header has two tabs: **Map** (the sun/shade view) and **About**,
   which fetches and renders this very readme live — edits to `readme.md`
-  show up there automatically, no rebuild needed.
+  show up there automatically, no rebuild needed. The area bar is hidden
+  while on About.
+- The About page renders each `##` section as a full-height, scroll-snapped
+  slide that fades/slides into view as you reach it (similar to Apple's
+  product pages) — a sidebar table of contents on the left tracks your
+  position, expanding the current chapter's title with a short preview
+  and collapsing the rest. Click a chapter to jump straight to it.
 - Below the header is the area bar. On open, the map shows a wide view
   of Copenhagen and loads nothing — pick one or more areas
   (Vesterbro/Frederiksberg, Nordvest/Bispebjerg, Nørrebro,

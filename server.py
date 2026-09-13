@@ -51,6 +51,19 @@ def read_cache(path, ttl_seconds):
         return None
 
 
+def read_stale_cache(path):
+    """Ignore TTL entirely — used as a last-resort fallback when the live
+    fetch fails, so a past-expiry (or orphaned, e.g. from an old bbox) cache
+    file is still better than a hard error."""
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return f.read()
+    except OSError:
+        return None
+
+
 def write_cache(path, body):
     try:
         with open(path, 'w', encoding='utf-8') as f:
@@ -111,7 +124,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 write_cache(path, body)
                 self._send_json(200, body, 'MISS')
             except Exception as err:
-                self._send_json(502, json.dumps({'error': str(err)}), 'ERROR')
+                stale = read_stale_cache(path)
+                if stale is not None:
+                    print('Overpass fetch failed, serving stale cache', path, err, flush=True)
+                    self._send_json(200, stale, 'STALE')
+                else:
+                    self._send_json(502, json.dumps({'error': str(err)}), 'ERROR')
             return
 
         self.send_error(404)
@@ -132,7 +150,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 write_cache(path, body)
                 self._send_json(200, body, 'MISS')
             except Exception as err:
-                self._send_json(502, json.dumps({'error': str(err)}), 'ERROR')
+                stale = read_stale_cache(path)
+                if stale is not None:
+                    print('DMI fetch failed, serving stale cache', path, err, flush=True)
+                    self._send_json(200, stale, 'STALE')
+                else:
+                    self._send_json(502, json.dumps({'error': str(err)}), 'ERROR')
             return
 
         super().do_GET()

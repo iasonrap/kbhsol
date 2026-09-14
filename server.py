@@ -99,6 +99,13 @@ def fetch_dmi(bbox):
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
+    def end_headers(self):
+        # This is a local dev tool under active development — never let the
+        # browser cache index.html/app.js/readme.md, or edits silently don't
+        # show up until a hard refresh (which varies by browser).
+        self.send_header('Cache-Control', 'no-store')
+        super().end_headers()
+
     def _send_json(self, status, body, cache_status):
         payload = body.encode('utf-8')
         self.send_response(status)

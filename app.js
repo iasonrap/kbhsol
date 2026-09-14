@@ -589,12 +589,12 @@ async function loadArea(areaId) {
     let state;
     if (!sunIsUp) {
       state = 'night';
+    } else if (isVenueShadowed(f.geometry.coordinates, buildings, sun.bearingDeg, sun.altitudeRad)) {
+      state = 'building-shade';
     } else if (!skyIsClearEnough) {
       state = 'cloudy';
     } else {
-      state = isVenueShadowed(f.geometry.coordinates, buildings, sun.bearingDeg, sun.altitudeRad)
-        ? 'building-shade'
-        : 'sun';
+      state = 'sun';
     }
     f.properties.state = state;
   }

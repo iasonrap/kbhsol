@@ -132,6 +132,22 @@ No build step, no bundler, no npm — everything loads from CDNs
   Only chrome (backgrounds, panels, text, building fill color, base map
   style) is theme-aware. Keep it that way; recoloring markers by theme
   would make the sun/shade meaning ambiguous.
+- **OSM venue fields (name, cuisine, phone, website, wheelchair, opening
+  hours) are untrusted input** — OpenStreetMap is community-edited, so
+  any of it can contain arbitrary text, including HTML/script. Every
+  insertion point runs it through `escapeHtml()` first (`website` also
+  through `safeHttpUrl()`, which rejects non-http(s) schemes like
+  `javascript:`). If you add a new place that renders an OSM field via
+  `innerHTML`, escape it the same way — this was a real, confirmed XSS
+  gap before it got fixed, not a hypothetical.
+- **`server.py`'s `/api/*` routes are hardened for being reachable beyond
+  localhost**: per-IP rate limiting (`rate_limited()`), a body-size cap
+  on `/api/overpass`, an allowlist for `parameterId` in `/api/weather`,
+  and bounds-checked `lat`/`lon` in `/api/forecast`. None of this does
+  anything while the server is bound to `localhost` only — it starts
+  mattering the moment that changes (public deploy, reverse proxy,
+  0.0.0.0 bind). Don't strip these when adding a new route; add the same
+  pattern to it.
 
 ## Testing changes
 

@@ -696,7 +696,7 @@ function addAreaLayers(areaId, buildings, venues) {
     map.getCanvas().style.cursor = 'pointer';
     const f = e.features[0];
     popup.setLngLat(f.geometry.coordinates)
-      .setHTML(`<b>${f.properties.name}</b><br>${f.properties.amenity}<br>${STATE_LABELS[f.properties.state]}`)
+      .setHTML(`<b>${escapeHtml(f.properties.name)}</b><br>${escapeHtml(f.properties.amenity)}<br>${STATE_LABELS[f.properties.state]}`)
       .addTo(map);
   });
   map.on('mouseleave', `venues-dots-${areaId}`, () => {
@@ -707,6 +707,32 @@ function addAreaLayers(areaId, buildings, venues) {
 }
 
 // --- Venue detail panel -----------------------------------------------
+//
+// Venue fields (name, cuisine, phone, website, wheelchair, opening_hours)
+// come from OpenStreetMap, which anyone can edit — treat them as untrusted
+// input. Every one of them gets HTML-escaped before going into innerHTML,
+// and website/phone links are additionally scheme-validated, so a
+// vandalized OSM entry can't run script in a visitor's browser.
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// Only allow http(s) URLs through to an href — blocks javascript: and other
+// dangerous schemes a malicious OSM `website` tag could contain.
+function safeHttpUrl(raw) {
+  try {
+    const url = new URL(raw, location.href);
+    return (url.protocol === 'http:' || url.protocol === 'https:') ? url.href : null;
+  } catch {
+    return null;
+  }
+}
 
 const STATE_COLORS = {
   sun: '#ffd166',
@@ -865,7 +891,7 @@ function renderOpeningHours(raw) {
   }
   const parsed = parseOpeningHours(raw);
   if (!parsed) {
-    return `<div class="vd-info-row">🕒 ${raw}</div>`; // couldn't parse safely — show as-is
+    return `<div class="vd-info-row">🕒 ${escapeHtml(raw)}</div>`; // couldn't parse safely — show as-is
   }
 
   const todayJs = new Date().getDay();       // 0 = Sunday
@@ -888,16 +914,28 @@ function openVenueDetail(feature) {
   const stateTextColor = ['sun', 'partly-sunny', 'partly-cloudy'].includes(p.state) ? '#14161a' : '#fff';
 
   const infoRows = [renderOpeningHours(p.opening_hours)];
-  if (p.cuisine) infoRows.push(`<div class="vd-info-row">🍽️ ${p.cuisine.replace(/_/g, ' ').replace(/;/g, ', ')}</div>`);
+  if (p.cuisine) infoRows.push(`<div class="vd-info-row">🍽️ ${escapeHtml(p.cuisine.replace(/_/g, ' ').replace(/;/g, ', '))}</div>`);
   else infoRows.push(`<div class="vd-info-row">🍽️ Cuisine: not available on OSM</div>`);
   infoRows.push(`<div class="vd-info-row">🌳 Outdoor seating: ${p.outdoor_seating === 'yes' ? 'Yes' : p.outdoor_seating === 'no' ? 'No' : 'Not available on OSM'}</div>`);
-  if (p.phone) infoRows.push(`<div class="vd-info-row">📞 <a href="tel:${p.phone}">${p.phone}</a></div>`);
-  if (p.website) infoRows.push(`<div class="vd-info-row">🔗 <a href="${p.website}" target="_blank" rel="noopener">${p.website.replace(/^https?:\/\//, '')}</a></div>`);
-  if (p.wheelchair) infoRows.push(`<div class="vd-info-row">♿ Wheelchair access: ${p.wheelchair}</div>`);
+  if (p.phone) {
+    // tel: hrefs only make sense with digits/+/-/space/parens — strip anything else
+    // rather than trusting the raw OSM value into an href.
+    const telHref = p.phone.replace(/[^\d+\-() ]/g, '');
+    infoRows.push(`<div class="vd-info-row">📞 <a href="tel:${escapeHtml(telHref)}">${escapeHtml(p.phone)}</a></div>`);
+  }
+  if (p.website) {
+    const href = safeHttpUrl(p.website);
+    if (href) {
+      infoRows.push(`<div class="vd-info-row">🔗 <a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${escapeHtml(p.website.replace(/^https?:\/\//, ''))}</a></div>`);
+    } else {
+      infoRows.push(`<div class="vd-info-row">🔗 ${escapeHtml(p.website)}</div>`);
+    }
+  }
+  if (p.wheelchair) infoRows.push(`<div class="vd-info-row">♿ Wheelchair access: ${escapeHtml(p.wheelchair)}</div>`);
 
   venueDetailContent.innerHTML = `
-    <div class="vd-name">${p.name}</div>
-    <div class="vd-amenity">${p.amenity}</div>
+    <div class="vd-name">${escapeHtml(p.name)}</div>
+    <div class="vd-amenity">${escapeHtml(p.amenity)}</div>
     <div class="vd-state" style="background:${stateColor};color:${stateTextColor}">${STATE_LABELS[p.state]}</div>
 
     <div class="vd-section">

@@ -199,3 +199,24 @@ layer entirely.
   local caching proxy rather than saved into static `.geojson` files, so
   the app still depends on Overpass being reachable the first time an
   area is loaded (or once every 20 minutes after that).
+
+## Security notes
+
+- **OSM venue data (name, cuisine, phone, website, wheelchair, opening
+  hours) is treated as untrusted input** — OpenStreetMap is community-edited,
+  so any of it could contain a crafted HTML/script payload. Every field is
+  HTML-escaped before insertion (`app.js`'s `escapeHtml`), and `website`
+  links are scheme-validated (`safeHttpUrl`) so a `javascript:` URL in a
+  vandalized OSM entry can't run. Don't insert any OSM-derived field via
+  `innerHTML` without going through these first.
+- **`server.py` binds to `localhost` only** by default — that's what makes
+  the endpoints below safe today. The moment it's exposed beyond your own
+  machine (a public deploy, a reverse proxy, changing the bind address),
+  the following start to matter: `/api/overpass`, `/api/weather`, and
+  `/api/forecast` are unauthenticated proxies to third-party APIs, so
+  they're hardened against being used as an open relay — per-IP rate
+  limiting (30 req/min), a body-size cap on Overpass queries, an allowlist
+  for `parameterId`, and bounds-checked `lat`/`lon`. `ThreadingHTTPServer`
+  is used instead of plain `HTTPServer` so one slow client can't block
+  every other request. None of this is a substitute for real auth if this
+  ever needs to be more than a personal tool on the open internet.

@@ -12,11 +12,14 @@ import hashlib
 import http.server
 import json
 import os
+import re
+import threading
 import time
 import urllib.request
 import urllib.error
+from collections import defaultdict, deque
 from datetime import datetime, timezone
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 
 USER_AGENT = 'FollowTheSun/1.0 (personal weather/shadow map; contact: github.com/iasonrap)'
 
@@ -48,6 +51,44 @@ OVERPASS_URLS = [
 ]
 DMI_OBS_URL = 'https://opendataapi.dmi.dk/v2/metObs/collections/observation/items'
 DMI_FORECAST_URL = 'https://opendataapi.dmi.dk/v1/forecastedr/collections/harmonie_dini_sf/position'
+
+# --- Hardening for running this publicly, not just on localhost --------
+#
+# These endpoints proxy to third-party APIs with no auth in front of them.
+# Without limits, anyone who finds the URL could use this server as a free
+# open proxy to Overpass/DMI (burning our quota, risking our IP getting
+# rate-limited or blocked by them) or fill the disk with cache files keyed
+# by arbitrary input. None of this matters for local personal use, but it
+# does the moment this is reachable from the internet.
+MAX_OVERPASS_BODY_BYTES = 20_000  # our real queries are a few hundred bytes
+ALLOWED_WEATHER_PARAMETERS = {'cloud_cover', 'temp_dry', 'wind_speed', 'wind_dir'}
+STATION_ID_RE = re.compile(r'^\d{4,6}$')
+RATE_LIMIT_WINDOW_SECONDS = 60
+RATE_LIMIT_MAX_REQUESTS = 30  # generous for legitimate multi-area use, not for scripted abuse
+
+_rate_limit_lock = threading.Lock()
+_rate_limit_hits = defaultdict(deque)  # client_ip -> deque of recent request timestamps
+
+
+def rate_limited(client_ip):
+    now = time.time()
+    with _rate_limit_lock:
+        hits = _rate_limit_hits[client_ip]
+        while hits and now - hits[0] > RATE_LIMIT_WINDOW_SECONDS:
+            hits.popleft()
+        if len(hits) >= RATE_LIMIT_MAX_REQUESTS:
+            return True
+        hits.append(now)
+        return False
+
+
+def valid_latlon(value, lo, hi):
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if lo <= f <= hi else None
+
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -110,7 +151,8 @@ def fetch_overpass(query, retries=2):
 
 
 def fetch_dmi(station_id, parameter_id):
-    url = f'{DMI_OBS_URL}?parameterId={parameter_id}&stationId={station_id}&limit=1&sortorder=observed,DESC'
+    url = (f'{DMI_OBS_URL}?parameterId={quote(parameter_id)}&stationId={quote(station_id)}'
+           f'&limit=1&sortorder=observed,DESC')
     req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
     with urllib.request.urlopen(req, timeout=30) as resp:
         return resp.read().decode('utf-8')
@@ -128,7 +170,8 @@ def fetch_dmi_forecast_cloud_cover(lat, lon, retries=4):
 
     This endpoint rate-limits more aggressively than the observation API — retry
     with backoff rather than erroring out on the first 429."""
-    url = f'{DMI_FORECAST_URL}?coords=POINT({lon}%20{lat})&parameter-name=fraction-of-cloud-cover&crs=crs84'
+    url = (f'{DMI_FORECAST_URL}?coords={quote(f"POINT({lon} {lat})")}'
+           f'&parameter-name=fraction-of-cloud-cover&crs=crs84')
     req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
 
     last_err = None
@@ -176,10 +219,28 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _send_error_json(self, status, message):
+        self._send_json(status, json.dumps({'error': message}), 'ERROR')
+
+    def _client_ip(self):
+        return self.client_address[0]
+
     def do_POST(self):
         if self.path == '/api/overpass':
-            length = int(self.headers.get('Content-Length', 0))
-            query = self.rfile.read(length).decode('utf-8')
+            if rate_limited(self._client_ip()):
+                self._send_error_json(429, 'Too many requests')
+                return
+
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+            except ValueError:
+                length = -1
+            if length < 0 or length > MAX_OVERPASS_BODY_BYTES:
+                self._send_error_json(413, 'Request body too large')
+                self.close_connection = True
+                return
+
+            query = self.rfile.read(length).decode('utf-8', errors='replace')
             path = cache_path('overpass', query)
 
             cached = read_cache(path, OVERPASS_CACHE_TTL_SECONDS)
@@ -197,16 +258,26 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     print('Overpass fetch failed, serving stale cache', path, err, flush=True)
                     self._send_json(200, stale, 'STALE')
                 else:
-                    self._send_json(502, json.dumps({'error': str(err)}), 'ERROR')
+                    print('Overpass fetch failed, no stale cache available', path, err, flush=True)
+                    self._send_error_json(502, 'Upstream request failed')
             return
 
         self.send_error(404)
 
     def do_GET(self):
         if self.path.startswith('/api/forecast'):
+            if rate_limited(self._client_ip()):
+                self._send_error_json(429, 'Too many requests')
+                return
+
             qs = parse_qs(urlparse(self.path).query)
-            lat = qs.get('lat', [''])[0]
-            lon = qs.get('lon', [''])[0]
+            # Denmark-ish bounding box — generous, just enough to catch garbage/injection
+            # attempts rather than to be a precise territorial check.
+            lat = valid_latlon(qs.get('lat', [''])[0], 54, 58)
+            lon = valid_latlon(qs.get('lon', [''])[0], 7, 16)
+            if lat is None or lon is None:
+                self._send_error_json(400, 'Invalid lat/lon')
+                return
             path = cache_path('forecast', f'{lat},{lon}')
 
             cached = read_cache(path, FORECAST_CACHE_TTL_SECONDS)
@@ -224,13 +295,24 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     print('DMI forecast fetch failed, serving stale cache', path, err, flush=True)
                     self._send_json(200, stale, 'STALE')
                 else:
-                    self._send_json(502, json.dumps({'error': str(err)}), 'ERROR')
+                    print('DMI forecast fetch failed, no stale cache available', path, err, flush=True)
+                    self._send_error_json(502, 'Upstream request failed')
             return
 
         if self.path.startswith('/api/weather'):
+            if rate_limited(self._client_ip()):
+                self._send_error_json(429, 'Too many requests')
+                return
+
             qs = parse_qs(urlparse(self.path).query)
             station_id = qs.get('stationId', [''])[0]
             parameter_id = qs.get('parameterId', ['cloud_cover'])[0]
+            if not STATION_ID_RE.match(station_id):
+                self._send_error_json(400, 'Invalid stationId')
+                return
+            if parameter_id not in ALLOWED_WEATHER_PARAMETERS:
+                self._send_error_json(400, 'Invalid parameterId')
+                return
             path = cache_path('weather', f'{parameter_id}|{station_id}')
 
             cached = read_cache(path, WEATHER_CACHE_TTL_SECONDS)
@@ -248,7 +330,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     print('DMI fetch failed, serving stale cache', path, err, flush=True)
                     self._send_json(200, stale, 'STALE')
                 else:
-                    self._send_json(502, json.dumps({'error': str(err)}), 'ERROR')
+                    print('DMI fetch failed, no stale cache available', path, err, flush=True)
+                    self._send_error_json(502, 'Upstream request failed')
             return
 
         super().do_GET()
@@ -260,4 +343,8 @@ if __name__ == '__main__':
     print(f'Serving Københavns Sol on http://localhost:{port} '
           f'(cache in ./data/ — OSM: {OVERPASS_CACHE_TTL_SECONDS // 86400}d, '
           f'weather: {WEATHER_CACHE_TTL_SECONDS // 60}m, forecast: {FORECAST_CACHE_TTL_SECONDS // 60}m)')
-    http.server.HTTPServer(('localhost', port), Handler).serve_forever()
+    # ThreadingHTTPServer, not plain HTTPServer — the latter handles one
+    # connection at a time, so a single slow/hanging client would block
+    # every other request. Trivial fix, meaningfully better once this is
+    # reachable from more than just your own browser.
+    http.server.ThreadingHTTPServer(('localhost', port), Handler).serve_forever()

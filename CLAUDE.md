@@ -222,14 +222,19 @@ No build step, no bundler, no npm — everything loads from CDNs
   `javascript:`). If you add a new place that renders an OSM field via
   `innerHTML`, escape it the same way — this was a real, confirmed XSS
   gap before it got fixed, not a hypothetical.
-- **`server.py`'s `/api/*` routes are hardened for being reachable beyond
-  localhost**: per-IP rate limiting (`api_rate_limited()`/
+- **`server.py` binds to `0.0.0.0`, not `localhost`** — deliberate, so a
+  phone or other device on the same Wi-Fi can reach it (the startup
+  banner prints both the `localhost` and LAN-IP URLs, via `_lan_ip()`'s
+  UDP-connect-without-sending trick to ask the OS which interface it'd
+  use). This used to be `localhost`-only; **all of the hardening below
+  is what made changing it safe, and it's no longer optional/conditional
+  — it always applies now**, not just "if this ever gets exposed."
+  Don't bind to `localhost` again without re-adding an explicit opt-in
+  for LAN access, and don't add a new `/api/*` route without the same
+  hardening pattern: per-IP rate limiting (`api_rate_limited()`/
   `static_rate_limited()`), a body-size cap on `/api/overpass`, an
   allowlist for `parameterId` in `/api/weather`, and bounds-checked
-  `lat`/`lon` in `/api/forecast`. None of this does anything while the
-  server is bound to `localhost` only — it starts mattering the moment
-  that changes (public deploy, reverse proxy, 0.0.0.0 bind). Don't strip
-  these when adding a new route; add the same pattern to it.
+  `lat`/`lon` in `/api/forecast`.
 - **Static file serving is an allowlist (`PUBLIC_PATHS`), not a
   blocklist — do not change this back.** This was a real, confirmed,
   serious vulnerability, not a theoretical one: before this fix,
@@ -373,6 +378,29 @@ No build step, no bundler, no npm — everything loads from CDNs
   sits top-right. Confirmed live with bounding-box coordinates that the
   two no longer overlap at any panel width, collapsed or not. If the
   map's own control position ever changes, recheck this.
+- **The venue detail panel's "🧭 Navigate" button opens a custom bottom
+  sheet (`#nav-sheet`/`#nav-sheet-backdrop`), not the OS's native
+  app-picker.** There is no browser API that invokes that — it's
+  `MKMapItem`/`UIActivityViewController` on iOS or an Intent chooser on
+  Android, both native-app-only, unreachable from a web page. The sheet
+  is styled to feel like the native one (the user's actual ask, prompted
+  by a screenshot of iOS's own "Navigate with…" sheet) while staying
+  fully within our control. Two things worth knowing if you touch this:
+  (1) `navTargetCoords` is a single shared module-level variable, not
+  per-instance state — the sheet's two option buttons (`#nav-google-maps`,
+  `#nav-apple-maps`) are static, created once in `index.html`, and
+  `openNavigateSheet(lat, lon)` just overwrites `navTargetCoords` each
+  time a venue's Navigate button is clicked, rather than the sheet being
+  rebuilt per-venue the way `openVenueDetail`'s content is — this is
+  deliberate and fine precisely because only one sheet can ever be open
+  at a time. (2) The links are `https://www.google.com/maps/dir/?api=1&
+  destination={lat},{lon}&travelmode=walking` and `https://maps.apple.com
+  /?daddr={lat},{lon}&dirflg=w` — both universal web links (not `geo:`/
+  `maps://` custom schemes), confirmed live to correctly hand off to the
+  respective app when installed or fall back to each provider's own web
+  maps otherwise; `travelmode=walking`/`dirflg=w` default to walking
+  directions since these are cafés/bars/restaurants someone's walking to,
+  not driving.
 
 ## Testing changes
 

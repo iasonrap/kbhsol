@@ -13,6 +13,7 @@ import http.server
 import json
 import os
 import re
+import socket
 import threading
 import time
 import urllib.request
@@ -535,14 +536,42 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_error(404)
 
 
+def _lan_ip():
+    # Doesn't actually send anything (UDP, connect() only sets the socket's
+    # routing without a handshake) — just asks the OS which local interface
+    # it would use to reach the internet, which is the LAN IP other devices
+    # on the same Wi-Fi can reach this machine at.
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(('8.8.8.8', 80))
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
 if __name__ == '__main__':
     port = 8123
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
-    print(f'Serving Københavns Sol on http://localhost:{port} '
-          f'(cache in ./data/ — OSM: {OVERPASS_CACHE_TTL_SECONDS // 86400}d, '
+    # Binds to 0.0.0.0 (all interfaces), not just localhost — deliberate,
+    # so a phone or another device on the same Wi-Fi can reach it. This is
+    # exactly the "reachable beyond localhost" scenario the hardening
+    # elsewhere in this file (rate limiting, the PUBLIC_PATHS allowlist,
+    # input validation) was already built for; it wasn't safe to do this
+    # before that work, it is now. Still only as safe as the network it's
+    # on — fine for a trusted home Wi-Fi, not for a coffee shop's.
+    lan_ip = _lan_ip()
+    print(f'Serving Københavns Sol — cache in ./data/ '
+          f'(OSM: {OVERPASS_CACHE_TTL_SECONDS // 86400}d, '
           f'weather: {WEATHER_CACHE_TTL_SECONDS // 60}m, forecast: {FORECAST_CACHE_TTL_SECONDS // 60}m)')
+    print(f'  On this machine:        http://localhost:{port}')
+    if lan_ip:
+        print(f'  On your phone/Wi-Fi:    http://{lan_ip}:{port}')
+    else:
+        print('  Could not detect a LAN IP for phone access — check you\'re connected to Wi-Fi.')
     # ThreadingHTTPServer, not plain HTTPServer — the latter handles one
     # connection at a time, so a single slow/hanging client would block
     # every other request. Trivial fix, meaningfully better once this is
     # reachable from more than just your own browser.
-    http.server.ThreadingHTTPServer(('localhost', port), Handler).serve_forever()
+    http.server.ThreadingHTTPServer(('0.0.0.0', port), Handler).serve_forever()

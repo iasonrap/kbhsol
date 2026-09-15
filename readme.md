@@ -119,6 +119,10 @@ the static files and proxies/caches the Overpass and DMI requests — don't
 use plain `python3 -m http.server` any more, since that skips the caching
 layer entirely.
 
+The terminal also prints a second URL, `http://<your-LAN-IP>:8123` — open
+that one on your phone or another device connected to the same Wi-Fi as
+your laptop to use the app there too, no extra setup needed.
+
 ## Using the app
 
 - The header has three tabs: **Map** (the sun/shade view), **About**, which
@@ -185,6 +189,14 @@ layer entirely.
   glass (bar/pub), or a fork & knife (restaurant).
 - Hover over a dot for a quick popup with its name, type, and current
   state. Click a dot to open a detail panel on the right with:
+  - **A "🧭 Navigate" button**, right under the venue's name and type,
+    opens a bottom-sheet chooser to get walking directions there in
+    either Google Maps or Apple Maps. This isn't the OS's own native
+    app-picker — no web page can actually invoke that, it's a
+    native-app-only feature — it's a small in-app sheet built to feel
+    like it, opening `google.com/maps/dir` or `maps.apple.com` with the
+    venue's coordinates in a new tab, which the OS then hands off to
+    whichever app (or its web fallback) is installed.
   - **Weather in [area]** — temperature and wind speed/direction come
     from the nearest DMI observation station, shared by every venue in
     the area (different *areas* do get different stations, e.g. Nordvest
@@ -263,12 +275,18 @@ layer entirely.
   (`/`, `/index.html`, `/app.js`, `/readme.md`) are servable; everything
   else 404s before it ever reaches the file-serving code, so there's no
   directory to list and nothing else to enumerate.
-- **`server.py` binds to `localhost` only** by default — that's what makes
-  the endpoints below safe today. The moment it's exposed beyond your own
-  machine (a public deploy, a reverse proxy, changing the bind address),
-  the following start to matter: `/api/overpass`, `/api/weather`, and
-  `/api/forecast` are unauthenticated proxies to third-party APIs, so
-  they're hardened against being used as an open relay — per-IP rate
+- **`server.py` binds to `0.0.0.0`**, not just `localhost` — deliberate,
+  so it's reachable from a phone or another device on the same Wi-Fi
+  (the terminal prints both URLs on startup: `http://localhost:8123` for
+  this machine, `http://<your-LAN-IP>:8123` for everything else on the
+  network). This is exactly the "reachable beyond localhost" scenario
+  the hardening below exists for, and it wasn't safe to bind this way
+  before that work landed — it is now, on a trusted home network. It's
+  still only as safe as the network it's on, though: anyone else on that
+  same Wi-Fi (a coffee shop, a shared office network) can also reach it,
+  not just you. `/api/overpass`, `/api/weather`, and `/api/forecast` are
+  unauthenticated proxies to third-party APIs, so they're hardened
+  against being used as an open relay — per-IP rate
   limiting, a body-size cap on Overpass queries, an allowlist for
   `parameterId`, and bounds-checked `lat`/`lon`. Rate limiting is two
   separate budgets: 120 requests/minute for the routes that cost a real

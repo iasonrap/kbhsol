@@ -1258,6 +1258,7 @@ function openVenueDetail(feature) {
   venueDetailContent.innerHTML = `
     <div class="vd-name">${escapeHtml(p.name)}</div>
     <div class="vd-amenity">${escapeHtml(p.amenity)}</div>
+    <button class="vd-navigate-btn" id="vd-navigate">🧭 Navigate</button>
     <div class="vd-state" style="background:${stateColor};color:${stateTextColor}">${STATE_LABELS[p.state]}</div>
 
     <div class="vd-section">
@@ -1288,7 +1289,58 @@ function openVenueDetail(feature) {
     </div>
   `;
   venueDetail.hidden = false;
+
+  const [lon, lat] = feature.geometry.coordinates;
+  document.getElementById('vd-navigate').addEventListener('click', () => openNavigateSheet(lat, lon));
 }
+
+// --- "Navigate with..." chooser --------------------------------------------
+//
+// There's no browser API that opens the OS's actual native "choose a
+// navigation app" sheet — that's a native-app-only feature (MKMapItem /
+// Intent chooser). This is our own bottom sheet built to feel like it,
+// offering the two map apps people actually have, rather than trying (and
+// failing) to fake the real one.
+let navTargetCoords = null;
+const navSheet = document.getElementById('nav-sheet');
+const navSheetBackdrop = document.getElementById('nav-sheet-backdrop');
+
+function openNavigateSheet(lat, lon) {
+  navTargetCoords = { lat, lon };
+  navSheetBackdrop.hidden = false;
+  navSheet.hidden = false;
+  // Force layout before adding .show so the opacity/transform transition
+  // actually plays instead of snapping straight to its end state.
+  navSheetBackdrop.offsetHeight;
+  navSheetBackdrop.classList.add('show');
+  navSheet.classList.add('show');
+}
+
+function closeNavigateSheet() {
+  navSheetBackdrop.classList.remove('show');
+  navSheet.classList.remove('show');
+  setTimeout(() => {
+    navSheetBackdrop.hidden = true;
+    navSheet.hidden = true;
+  }, 200);
+}
+
+navSheetBackdrop.addEventListener('click', closeNavigateSheet);
+document.getElementById('nav-sheet-cancel').addEventListener('click', closeNavigateSheet);
+document.getElementById('nav-google-maps').addEventListener('click', () => {
+  if (navTargetCoords) {
+    const { lat, lon } = navTargetCoords;
+    window.open(`https://www.google.com/maps/dir/?api=1&destination=${lat},${lon}&travelmode=walking`, '_blank', 'noopener');
+  }
+  closeNavigateSheet();
+});
+document.getElementById('nav-apple-maps').addEventListener('click', () => {
+  if (navTargetCoords) {
+    const { lat, lon } = navTargetCoords;
+    window.open(`https://maps.apple.com/?daddr=${lat},${lon}&dirflg=w`, '_blank', 'noopener');
+  }
+  closeNavigateSheet();
+});
 
 function removeAreaLayers(areaId) {
   for (const id of [`venues-icons-${areaId}`, `venues-dots-${areaId}`, `venues-glow-${areaId}`, `buildings-3d-${areaId}`]) {

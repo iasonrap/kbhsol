@@ -57,23 +57,29 @@ const CLOUD_TIERS = [
 ];
 
 function cloudTierState(cloudCover) {
-  if (cloudCover == null) return 'sun'; // unknown reading — assume clear rather than block the whole area
+  // A failed/missing forecast fetch must NOT be treated as clear sky — that
+  // silently mislabeled venues as sunny when DMI's forecast endpoint (which
+  // rate-limits more aggressively than the others) failed for their grid
+  // cell. Surface it as its own "unknown" state instead of guessing.
+  if (cloudCover == null) return 'unknown';
   return CLOUD_TIERS.find(tier => cloudCover < tier.max).state;
 }
 const SHADOW_RAY_METERS = 200;    // how far to search for occluding buildings
 
 const panel = document.getElementById('panel');
 
-// --- Tabs (Map / About) ------------------------------------------------
+// --- Tabs (Map / About / Track) -----------------------------------------
 
 document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
     tab.classList.add('active');
-    const isMap = tab.dataset.view === 'map';
-    document.getElementById('map-view').hidden = !isMap;
-    document.getElementById('about-view').hidden = isMap;
-    document.getElementById('area-bar').hidden = !isMap;
+    const view = tab.dataset.view;
+    document.getElementById('map-view').hidden = view !== 'map';
+    document.getElementById('about-view').hidden = view !== 'about';
+    document.getElementById('track-view').hidden = view !== 'track';
+    document.getElementById('area-bar').hidden = view !== 'map';
+    if (view === 'track') loadTrackData();
   });
 });
 
@@ -177,6 +183,219 @@ document.querySelector('[data-view="about"]').addEventListener('click', async ()
   }
 });
 
+// --- Track tab (API request log + charts) --------------------------------
+//
+// Every proxied request server.py makes (Overpass venues/buildings, DMI
+// forecast tiles, DMI observation stations) is logged server-side to
+// data/api_log.jsonl regardless of whether it was a cache hit — this tab
+// visualizes that log so it's obvious whether the caching/grid-snapping
+// design is actually working, or if something's quietly spamming DMI.
+
+const TRACK_PALETTE = ['#ffd166', '#5e96e0', '#c76dd6', '#4caf7d', '#e0955e', '#7ad1c9', '#e05d8d', '#a3a86c'];
+
+let trackEntries = null;
+let trackGranularity = 'hour';
+
+document.querySelectorAll('.track-gran-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.track-gran-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    trackGranularity = btn.dataset.granularity;
+    if (trackEntries) renderTrackView(trackEntries);
+  });
+});
+
+document.getElementById('track-refresh').addEventListener('click', () => loadTrackData(true));
+
+async function loadTrackData(forceRefresh = false) {
+  if (trackEntries && !forceRefresh) return;
+  const refreshBtn = document.getElementById('track-refresh');
+  refreshBtn.classList.add('spinning');
+  try {
+    const res = await fetch('/api/logs?limit=8000');
+    if (!res.ok) throw new Error(`log fetch responded ${res.status}`);
+    const data = await res.json();
+    trackEntries = data.entries || [];
+    renderTrackView(trackEntries);
+  } catch (err) {
+    console.error('Failed to load API log', err);
+    document.getElementById('track-summary').innerHTML =
+      `<div class="track-stat bad"><div class="n">—</div><div class="l">Could not load the request log</div></div>`;
+  } finally {
+    refreshBtn.classList.remove('spinning');
+  }
+}
+
+function buildTrackBuckets(granularity) {
+  const buckets = [];
+  const now = new Date();
+  if (granularity === 'hour') {
+    now.setMinutes(0, 0, 0);
+    for (let i = 23; i >= 0; i--) {
+      const start = new Date(now.getTime() - i * 3600 * 1000);
+      buckets.push({ start, label: start.getHours().toString().padStart(2, '0') + ':00' });
+    }
+    return { buckets, bucketMs: 3600 * 1000 };
+  }
+  now.setHours(0, 0, 0, 0);
+  for (let i = 13; i >= 0; i--) {
+    const start = new Date(now.getTime() - i * 86400 * 1000);
+    buckets.push({ start, label: start.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }) });
+  }
+  return { buckets, bucketMs: 86400 * 1000 };
+}
+
+function renderTrackView(entries) {
+  const { buckets, bucketMs } = buildTrackBuckets(trackGranularity);
+  renderTrackSummary(entries);
+
+  renderTrackChart('chart-overpass', 'legend-overpass', entries, buckets, bucketMs, {
+    filterKind: 'overpass',
+    groupKey: e => e.areaId || 'unknown',
+    groupLabel: g => (AREAS[g] && AREAS[g].label) || g
+  });
+  renderTrackChart('chart-forecast', 'legend-forecast', entries, buckets, bucketMs, {
+    filterKind: 'forecast',
+    groupKey: e => e.cell || 'unknown',
+    groupLabel: g => g
+  });
+  renderTrackChart('chart-weather', 'legend-weather', entries, buckets, bucketMs, {
+    filterKind: 'weather',
+    groupKey: e => e.stationId || 'unknown',
+    groupLabel: g => (WEATHER_STATIONS.find(s => s.id === g) || {}).name || g
+  });
+
+  renderTrackLogTable(entries);
+}
+
+function renderTrackSummary(entries) {
+  const total = entries.length;
+  const upstream = entries.filter(e => e.cache === 'MISS' || e.cache === 'STALE' || e.cache === 'ERROR').length;
+  const hits = entries.filter(e => e.cache === 'HIT').length;
+  const errors = entries.filter(e => e.cache === 'ERROR').length;
+  const hitRate = total ? Math.round((hits / total) * 100) : 0;
+
+  document.getElementById('track-summary').innerHTML = `
+    <div class="track-stat"><div class="n">${total}</div><div class="l">Total requests logged</div></div>
+    <div class="track-stat good"><div class="n">${hits}</div><div class="l">Cache hits (no upstream call)</div></div>
+    <div class="track-stat warn"><div class="n">${upstream}</div><div class="l">Real upstream calls</div></div>
+    <div class="track-stat ${hitRate >= 50 ? 'good' : 'warn'}"><div class="n">${hitRate}%</div><div class="l">Cache hit rate</div></div>
+    <div class="track-stat ${errors ? 'bad' : ''}"><div class="n">${errors}</div><div class="l">Upstream errors</div></div>
+  `;
+}
+
+function renderTrackChart(chartElId, legendElId, entries, buckets, bucketMs, { filterKind, groupKey, groupLabel, topN = 6 }) {
+  const chartEl = document.getElementById(chartElId);
+  const legendEl = document.getElementById(legendElId);
+  const filtered = entries.filter(e => e.kind === filterKind);
+
+  if (!filtered.length) {
+    chartEl.innerHTML = '<div class="track-empty">No requests logged yet</div>';
+    legendEl.innerHTML = '';
+    return;
+  }
+
+  const totals = new Map();
+  for (const e of filtered) {
+    const g = groupKey(e);
+    totals.set(g, (totals.get(g) || 0) + 1);
+  }
+  const sortedGroups = [...totals.entries()].sort((a, b) => b[1] - a[1]);
+  const keepGroups = sortedGroups.slice(0, topN).map(([g]) => g);
+  const overflow = sortedGroups.slice(topN);
+  const hasOther = overflow.length > 0;
+  const resolveGroup = g => (keepGroups.includes(g) ? g : 'Other');
+
+  const bucketStart0 = buckets[0].start.getTime();
+  const matrix = buckets.map(() => new Map());
+  for (const e of filtered) {
+    const t = new Date(e.ts).getTime();
+    const idx = Math.floor((t - bucketStart0) / bucketMs);
+    if (idx < 0 || idx >= buckets.length) continue;
+    const g = resolveGroup(groupKey(e));
+    matrix[idx].set(g, (matrix[idx].get(g) || 0) + 1);
+  }
+
+  const displayGroups = hasOther ? [...keepGroups, 'Other'] : keepGroups;
+  const colors = displayGroups.map((g, i) => (g === 'Other' ? '#7a8496' : TRACK_PALETTE[i % TRACK_PALETTE.length]));
+
+  renderStackedBarSVG(chartEl, buckets, matrix, displayGroups, colors);
+
+  const otherTotal = overflow.reduce((s, [, c]) => s + c, 0);
+  legendEl.innerHTML = displayGroups.map((g, i) => {
+    const count = g === 'Other' ? otherTotal : totals.get(g);
+    const label = g === 'Other' ? `Other (${overflow.length})` : escapeHtml(groupLabel(g));
+    return `<span class="track-legend-item"><span class="track-legend-swatch" style="background:${colors[i]}"></span>${label}: ${count}</span>`;
+  }).join('');
+}
+
+function renderStackedBarSVG(container, buckets, matrix, groups, colors) {
+  const W = 600, H = 170, padBottom = 20;
+  const chartH = H - padBottom - 6;
+  const maxTotal = Math.max(1, ...matrix.map(m => groups.reduce((s, g) => s + (m.get(g) || 0), 0)));
+  const barSlot = W / buckets.length;
+  const barW = Math.max(2, barSlot * 0.62);
+
+  let bars = '';
+  buckets.forEach((b, i) => {
+    const m = matrix[i];
+    let y = H - padBottom;
+    const x = i * barSlot + (barSlot - barW) / 2;
+    groups.forEach((g, gi) => {
+      const v = m.get(g) || 0;
+      if (v <= 0) return;
+      const h = (v / maxTotal) * chartH;
+      y -= h;
+      bars += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" fill="${colors[gi]}" rx="1.5"><title>${escapeHtml(b.label)} · ${escapeHtml(String(g))}: ${v}</title></rect>`;
+    });
+  });
+
+  const labelEvery = Math.max(1, Math.ceil(buckets.length / 8));
+  let labels = '';
+  buckets.forEach((b, i) => {
+    if (i % labelEvery !== 0 && i !== buckets.length - 1) return;
+    const x = i * barSlot + barSlot / 2;
+    labels += `<text x="${x.toFixed(1)}" y="${H - 5}" text-anchor="middle" font-size="9" style="fill:var(--ink-dim)">${escapeHtml(b.label)}</text>`;
+  });
+
+  container.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="width:100%;height:170px;display:block;overflow:visible;">
+    <line x1="0" y1="${H - padBottom}" x2="${W}" y2="${H - padBottom}" style="stroke:var(--line)" stroke-width="1"/>
+    ${bars}
+    ${labels}
+  </svg>`;
+}
+
+function renderTrackLogTable(entries) {
+  const tbody = document.querySelector('#track-log-table tbody');
+  const recent = entries.slice(-300).reverse();
+  if (!recent.length) {
+    tbody.innerHTML = `<tr><td colspan="4" style="color:var(--ink-dim);text-align:center;padding:24px;">No requests logged yet</td></tr>`;
+    return;
+  }
+
+  const KIND_LABELS = { overpass: 'Overpass', forecast: 'Forecast', weather: 'Observation' };
+  tbody.innerHTML = recent.map(e => {
+    const time = new Date(e.ts).toLocaleString('da-DK', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    let detail = '';
+    if (e.kind === 'overpass') {
+      const label = (AREAS[e.areaId] && AREAS[e.areaId].label) || e.areaId || '—';
+      detail = `${escapeHtml(label)} · ${escapeHtml(e.requestKind || '')}`;
+    } else if (e.kind === 'forecast') {
+      detail = `tile ${escapeHtml(e.cell || '—')}`;
+    } else if (e.kind === 'weather') {
+      const stationName = (WEATHER_STATIONS.find(s => s.id === e.stationId) || {}).name || e.stationId;
+      detail = `${escapeHtml(stationName)} · ${escapeHtml(e.parameterId || '')}`;
+    }
+    const cache = escapeHtml(e.cache || '');
+    return `<tr>
+      <td>${escapeHtml(time)}</td>
+      <td>${KIND_LABELS[e.kind] || escapeHtml(e.kind)}</td>
+      <td>${detail}</td>
+      <td><span class="track-cache-badge ${cache}">${cache}</span></td>
+    </tr>`;
+  }).join('');
+}
+
 // --- Overpass fetch ---------------------------------------------------------
 
 function bboxStr(bbox) {
@@ -186,8 +405,12 @@ function bboxStr(bbox) {
 // Overpass and DMI requests go through our own tiny local proxy (server.py),
 // which caches responses to disk under data/ for 20 minutes — so clicking
 // areas on/off repeatedly doesn't re-hit the public APIs each time.
-async function fetchOverpass(query) {
-  const res = await fetch('/api/overpass', { method: 'POST', body: query });
+async function fetchOverpass(query, areaId, kind) {
+  // areaId/kind are only for the Track tab's request log — appended as query
+  // params rather than folded into the POST body, so they can't affect the
+  // cache key (which is the raw query text only).
+  const url = `/api/overpass?areaId=${encodeURIComponent(areaId)}&kind=${encodeURIComponent(kind)}`;
+  const res = await fetch(url, { method: 'POST', body: query });
   if (!res.ok) throw new Error(`Overpass proxy responded ${res.status}`);
   return res.json();
 }
@@ -198,11 +421,11 @@ async function fetchBuildings(areaId, bbox) {
     way["building"](${bboxStr(bbox)});
     out geom;
   `;
-  const data = await fetchOverpass(query);
+  const data = await fetchOverpass(query, areaId, 'buildings');
   return overpassBuildingsToGeoJSON(data);
 }
 
-async function fetchVenues(bbox) {
+async function fetchVenues(areaId, bbox) {
   const query = `
     [out:json][timeout:25];
     (
@@ -211,7 +434,7 @@ async function fetchVenues(bbox) {
     );
     out center;
   `;
-  const data = await fetchOverpass(query);
+  const data = await fetchOverpass(query, areaId, 'venues');
   return overpassVenuesToGeoJSON(data);
 }
 
@@ -303,10 +526,13 @@ async function fetchDmiParameter(stationId, parameterId) {
     if (!res.ok) throw new Error(`DMI proxy responded ${res.status}`);
     const data = await res.json();
     const value = data.features && data.features[0] && data.features[0].properties.value;
-    return typeof value === 'number' ? value : null;
+    return {
+      value: typeof value === 'number' ? value : null,
+      stale: res.headers.get('X-Cache') === 'STALE'
+    };
   } catch (err) {
     console.error(`DMI fetch failed for ${parameterId}`, err);
-    return null;
+    return { value: null, stale: false };
   }
 }
 
@@ -325,27 +551,87 @@ async function fetchForecastCloudCover(center) {
       // The hour this forecast value is FOR, not when the model run itself
       // was computed — DMI's API doesn't expose the latter, only each
       // step's valid time.
-      forecastTime: data.time ? new Date(data.time) : null
+      forecastTime: data.time ? new Date(data.time) : null,
+      // Server fell back to a cached response older than its normal TTL
+      // because the live DMI fetch failed (usually rate-limiting) — the
+      // data shown may be meaningfully out of date, surface that.
+      stale: res.headers.get('X-Cache') === 'STALE'
     };
   } catch (err) {
     console.error('DMI forecast fetch failed', err);
-    return { cloudCover: null, forecastTime: null };
+    return { cloudCover: null, forecastTime: null, stale: false };
   }
 }
 
-async function fetchWeather(center) {
+// Temp/wind still come from one nearest observation station per area (see
+// "Weather is per-area, not per-venue" in CLAUDE.md) — only cloud cover is
+// read per-venue now, via fetchVenueForecasts below.
+async function fetchStationWeather(center) {
   const station = nearestWeatherStation(center);
-  const [forecast, temperature, windSpeed, windDir] = await Promise.all([
-    fetchForecastCloudCover(center),
+  const [temp, wSpeed, wDir] = await Promise.all([
     fetchDmiParameter(station.id, 'temp_dry'),
     fetchDmiParameter(station.id, 'wind_speed'),
     fetchDmiParameter(station.id, 'wind_dir')
   ]);
   return {
-    cloudCover: forecast.cloudCover,
-    forecastTime: forecast.forecastTime,
-    temperature, windSpeed, windDir, station
+    temperature: temp.value,
+    windSpeed: wSpeed.value,
+    windDir: wDir.value,
+    obsStale: temp.stale || wSpeed.stale || wDir.stale,
+    station
   };
+}
+
+// Must match server.py's FORECAST_GRID_*_STEP — kept in sync by hand since
+// there's no shared config file. The server re-snaps anyway (it's the
+// authority on cache keys), but snapping client-side first means an area's
+// worth of venues collapses into one fetch per distinct cell instead of one
+// per venue, before any request is even sent.
+const FORECAST_GRID_LAT_STEP = 0.018;
+const FORECAST_GRID_LON_STEP = 0.032;
+
+function forecastGridCell(lon, lat) {
+  const snappedLat = Math.round(lat / FORECAST_GRID_LAT_STEP) * FORECAST_GRID_LAT_STEP;
+  const snappedLon = Math.round(lon / FORECAST_GRID_LON_STEP) * FORECAST_GRID_LON_STEP;
+  return { key: `${snappedLat.toFixed(4)},${snappedLon.toFixed(4)}`, lat: snappedLat, lon: snappedLon };
+}
+
+// Cloud cover is read at each venue's own coordinate (snapped to the model's
+// ~2km grid) rather than once at the area's center — a venue near an area's
+// edge can genuinely sit in a different forecast cell than its own area's
+// center (e.g. an Østerbro café close to the Nordhavn border), so sharing one
+// area-wide reading across every venue was giving edge venues the wrong
+// number. Venues are grouped by grid cell first, so this is one fetch per
+// distinct cell actually in play, not one per venue.
+async function fetchVenueForecasts(venues) {
+  const cells = new Map(); // cellKey -> { key, lat, lon }
+  for (const f of venues.features) {
+    const [lon, lat] = f.geometry.coordinates;
+    const cell = forecastGridCell(lon, lat);
+    if (!cells.has(cell.key)) cells.set(cell.key, cell);
+  }
+
+  const results = new Map(); // cellKey -> { cloudCover, forecastTime, stale }
+  await Promise.all([...cells.values()].map(async cell => {
+    results.set(cell.key, await fetchForecastCloudCover([cell.lon, cell.lat]));
+  }));
+
+  for (const f of venues.features) {
+    const [lon, lat] = f.geometry.coordinates;
+    const forecast = results.get(forecastGridCell(lon, lat).key);
+    f.properties.cloudCover = forecast.cloudCover;
+    // Store as an ISO string, not a Date — GeoJSON feature properties get
+    // round-tripped through MapLibre's tiling worker (addSource -> click
+    // event), which coerces a Date into a plain string anyway. Keeping a
+    // Date object here works right up until the first click, then throws
+    // ("...toLocaleTimeString is not a function") since what comes back
+    // out is a string masquerading as a Date — reconstruct it explicitly
+    // at render time instead (see openVenueDetail).
+    f.properties.forecastTime = forecast.forecastTime ? forecast.forecastTime.toISOString() : null;
+    f.properties.forecastStale = forecast.stale;
+  }
+
+  return results;
 }
 
 function windDirCompass(deg) {
@@ -605,7 +891,8 @@ const STATE_LABELS = {
   'building-shade': '🏢 Shaded',
   'partly-cloudy': '⛅ Partly Cloudy',
   'cloudy': '☁️ Cloudy',
-  'night': '🌙 Sun is down'
+  'night': '🌙 Sun is down',
+  'unknown': '❔ No forecast (N/A)'
 };
 
 let iconsRegistered = false;
@@ -630,6 +917,7 @@ function addAreaLayers(areaId, buildings, venues) {
     'partly-cloudy', '#c7ceda',
     'cloudy', '#8d97a5',
     'night', '#2a3868',
+    'unknown', '#ec4899',
     '#55617a'
   ];
 
@@ -687,6 +975,7 @@ function addAreaLayers(areaId, buildings, venues) {
         'sun', '#1a1306',
         'partly-sunny', '#1a1306',
         'partly-cloudy', '#1a1e29',
+        'unknown', '#1a0a13',
         '#f3ede1'
       ]
     }
@@ -740,7 +1029,8 @@ const STATE_COLORS = {
   'building-shade': '#55617a',
   'partly-cloudy': '#c7ceda',
   cloudy: '#8d97a5',
-  night: '#2a3868'
+  night: '#2a3868',
+  unknown: '#ec4899'
 };
 
 const venueDetail = document.getElementById('venue-detail');
@@ -908,7 +1198,15 @@ function renderOpeningHours(raw) {
 function openVenueDetail(feature) {
   const p = feature.properties;
   const areaData = loadedAreas[p.areaId];
-  const weather = areaData ? areaData.weather : {};
+  // Temp/wind/station stay area-wide; cloud cover/forecast time/staleness are
+  // this venue's own grid-cell reading (see fetchVenueForecasts), which can
+  // genuinely differ from the area's average shown in the top panel.
+  const weather = {
+    ...(areaData ? areaData.weather : {}),
+    cloudCover: p.cloudCover,
+    forecastTime: p.forecastTime ? new Date(p.forecastTime) : null,
+    forecastStale: p.forecastStale
+  };
   const areaLabel = areaData ? areaData.area.label : '';
   const stateColor = STATE_COLORS[p.state] || '#4a5568';
   const stateTextColor = ['sun', 'partly-sunny', 'partly-cloudy'].includes(p.state) ? '#14161a' : '#fff';
@@ -956,6 +1254,7 @@ function openVenueDetail(feature) {
       </div>
       ${weather.station ? `<div class="vd-station">Station: ${weather.station.name} (${weather.station.distanceKm.toFixed(1)} km away)</div>` : ''}
       ${weather.forecastTime ? `<div class="vd-station">Cloud forecast for ${weather.forecastTime.toLocaleTimeString('da-DK', { hour: '2-digit', minute: '2-digit' })}</div>` : ''}
+      ${(weather.forecastStale || weather.obsStale) ? `<div class="vd-stale-note">⚠️ DMI's live data is temporarily unavailable (likely rate-limited) — showing the last cached reading, which may be several hours old.</div>` : ''}
       ${p.windSheltered ? `<div class="vd-wind-note">🛡️ A building appears to block the wind here — it may feel calmer than the reading above.</div>` : ''}
     </div>
 
@@ -984,14 +1283,14 @@ function renderPanel() {
   }
   panel.hidden = false;
 
-  const total = { sun: 0, 'partly-sunny': 0, 'building-shade': 0, 'partly-cloudy': 0, cloudy: 0, night: 0 };
+  const total = { sun: 0, 'partly-sunny': 0, 'building-shade': 0, 'partly-cloudy': 0, cloudy: 0, night: 0, unknown: 0 };
   const areaRows = entries.map(({ area, sun, weather, sunAvailable, sunIsUp, counts }) => {
     for (const k in counts) total[k] += counts[k];
     return `
       <div class="panel-area">
         <p class="place">${area.label}</p>
-        <div class="meta">${sun.time.toLocaleTimeString('da-DK')} · Sun ${sun.altitudeDeg.toFixed(1)}° · Cloud ${weather.cloudCover == null ? '—' : weather.cloudCover.toFixed(0) + '%'}</div>
-        <div class="status">${sunAvailable ? 'Sun is out' : (sunIsUp ? 'Too cloudy' : 'Sun is down')}</div>
+        <div class="meta">${sun.time.toLocaleTimeString('da-DK')} · Sun ${sun.altitudeDeg.toFixed(1)}° · Cloud ${weather.cloudCover == null ? '—' : weather.cloudCover.toFixed(0) + '%'}${weather.forecastStale ? ' ⚠️' : ''}</div>
+        <div class="status">${sunAvailable ? 'Sun is out' : (sunIsUp ? 'Too cloudy' : 'Sun is down')}${weather.forecastStale ? ' · cached data' : ''}</div>
       </div>`;
   }).join('');
 
@@ -1011,6 +1310,7 @@ function renderPanel() {
       <div class="legend-row"><span class="dot partly-cloudy"></span>Partly cloudy<span class="count">${total['partly-cloudy']}</span></div>
       <div class="legend-row"><span class="dot cloudy"></span>Cloudy<span class="count">${total.cloudy}</span></div>
       <div class="legend-row"><span class="dot night"></span>Night<span class="count">${total.night}</span></div>
+      <div class="legend-row"><span class="dot unknown"></span>No forecast (N/A)<span class="count">${total.unknown}</span></div>
     </div>
   `;
 }
@@ -1029,7 +1329,7 @@ async function loadArea(areaId) {
 
   let buildings, venues;
   try {
-    const venuesPromise = fetchVenues(bbox).then(v => { markStepDone('venues'); return v; });
+    const venuesPromise = fetchVenues(areaId, bbox).then(v => { markStepDone('venues'); return v; });
     const buildingsPromise = fetchBuildings(areaId, bbox).then(b => { markStepDone('buildings'); return b; });
     setLoadingText('Fetching venues & building shapes from OpenStreetMap…');
     [buildings, venues] = await Promise.all([buildingsPromise, venuesPromise]);
@@ -1042,18 +1342,28 @@ async function loadArea(areaId) {
   }
 
   setLoadingText('Checking the sky over Copenhagen…');
-  const weather = await fetchWeather(center);
-  const { cloudCover } = weather;
+  const [stationWeather, forecastCells] = await Promise.all([
+    fetchStationWeather(center),
+    fetchVenueForecasts(venues)
+  ]);
   markStepDone('weather');
   const sun = getSunInfo(center[1], center[0]);
 
   setLoadingText('Tracing shadows…');
 
   const sunIsUp = sun.altitudeDeg > 0;
-  const cloudTier = cloudTierState(cloudCover);
-  const sunAvailable = sunIsUp && (cloudTier === 'sun' || cloudTier === 'partly-sunny');
+
+  // Area-level summary (panel header, legend) averages across whichever grid
+  // cells this area's venues actually span — with one venue or one cell in
+  // play that's just that cell's own reading, same as the old behavior.
+  const cellReadings = [...forecastCells.values()];
+  const cloudValues = cellReadings.map(r => r.cloudCover).filter(v => typeof v === 'number');
+  const avgCloudCover = cloudValues.length ? cloudValues.reduce((a, b) => a + b, 0) / cloudValues.length : null;
+  const forecastStale = cellReadings.some(r => r.stale);
+  const weather = { ...stationWeather, cloudCover: avgCloudCover, forecastStale };
 
   for (const f of venues.features) {
+    const cloudTier = cloudTierState(f.properties.cloudCover);
     let state;
     if (!sunIsUp) {
       state = 'night';
@@ -1074,8 +1384,9 @@ async function loadArea(areaId) {
   addAreaLayers(areaId, buildings, venues);
   areaDataCache[areaId] = { buildings, venues }; // kept so a day/night theme switch can relayer without re-fetching
 
-  const counts = { sun: 0, 'partly-sunny': 0, 'building-shade': 0, 'partly-cloudy': 0, cloudy: 0, night: 0 };
+  const counts = { sun: 0, 'partly-sunny': 0, 'building-shade': 0, 'partly-cloudy': 0, cloudy: 0, night: 0, unknown: 0 };
   for (const f of venues.features) counts[f.properties.state]++;
+  const sunAvailable = sunIsUp && (counts.sun > 0 || counts['partly-sunny'] > 0);
 
   loadedAreas[areaId] = { area, sun, weather, sunAvailable, sunIsUp, counts };
   renderPanel();

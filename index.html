@@ -37,6 +37,10 @@
     --line: rgba(20, 40, 60, 0.12);
     --ink: #1c2b3a;
     --ink-dim: #5b6c80;
+    /* The bright night-mode gold reads poorly on this light background —
+       a mid-tone goldenrod balances warmth/saturation with real contrast. */
+    --accent: #d4940c;
+    --accent-soft: #b8800d;
   }
 
   html, body {
@@ -88,19 +92,19 @@
   }
 
   main { flex: 1 1 auto; position: relative; min-height: 0; }
-  #map-view, #about-view { position: absolute; inset: 0; }
-  #about-view {
+  #map-view, #about-view, #track-view { position: absolute; inset: 0; }
+  #about-view, #track-view {
     overflow-y: auto; background: var(--bg);
     scrollbar-width: thin; scrollbar-color: var(--accent) var(--bg-deep);
-    scroll-snap-type: y mandatory;
   }
-  #about-view::-webkit-scrollbar { width: 12px; }
-  #about-view::-webkit-scrollbar-track { background: var(--bg-deep); }
-  #about-view::-webkit-scrollbar-thumb {
+  #about-view { scroll-snap-type: y mandatory; }
+  #about-view::-webkit-scrollbar, #track-view::-webkit-scrollbar { width: 12px; }
+  #about-view::-webkit-scrollbar-track, #track-view::-webkit-scrollbar-track { background: var(--bg-deep); }
+  #about-view::-webkit-scrollbar-thumb, #track-view::-webkit-scrollbar-thumb {
     background: linear-gradient(var(--accent), var(--accent-soft));
     border-radius: 8px; border: 3px solid var(--bg-deep);
   }
-  #about-view::-webkit-scrollbar-thumb:hover {
+  #about-view::-webkit-scrollbar-thumb:hover, #track-view::-webkit-scrollbar-thumb:hover {
     background: linear-gradient(#ffdd85, var(--accent));
   }
   [hidden] { display: none !important; }
@@ -140,6 +144,7 @@
   .dot.partly-cloudy { background: var(--partly-cloud); }
   .dot.cloudy { background: var(--cloud); }
   .dot.night { background: var(--night); }
+  .dot.unknown { background: #ec4899; }
 
   .about-layout {
     display: flex; align-items: flex-start; gap: 48px;
@@ -210,6 +215,67 @@
   #about-content a:hover { text-decoration: underline; }
   #about-content hr { border: none; border-top: 1px solid var(--line); margin: 32px 0; }
 
+  /* --- Track tab (API request log + charts) ----------------------------- */
+  .track-layout { max-width: 1080px; margin: 0 auto; padding: 32px 24px 80px; }
+  .track-header h2 {
+    font-family: 'Fraunces', serif; font-weight: 600; font-size: 30px; margin: 0 0 8px; color: var(--ink);
+  }
+  .track-header p { color: var(--ink-dim); font-size: 14.5px; max-width: 640px; margin: 0 0 20px; line-height: 1.55; }
+  .track-controls { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 24px; }
+  .track-gran { display: flex; gap: 6px; background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 4px; }
+  .track-gran-btn {
+    border: none; background: none; color: var(--ink-dim); font-family: inherit; font-size: 12.5px; font-weight: 600;
+    padding: 7px 14px; border-radius: 999px; cursor: pointer; transition: background 0.2s, color 0.2s;
+  }
+  .track-gran-btn.active { background: var(--accent); color: var(--accent-ink); }
+  .track-refresh-btn {
+    border: 1px solid var(--line); background: var(--panel); color: var(--ink); font-family: inherit;
+    font-size: 12.5px; font-weight: 600; padding: 8px 16px; border-radius: 999px; cursor: pointer; transition: border-color 0.2s;
+  }
+  .track-refresh-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .track-refresh-btn.spinning { opacity: 0.6; pointer-events: none; }
+
+  .track-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 28px; }
+  .track-stat {
+    background: var(--panel-solid); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px;
+  }
+  .track-stat .n { font-family: 'Fraunces', serif; font-size: 26px; font-weight: 600; color: var(--ink); line-height: 1.1; }
+  .track-stat .l { font-size: 11.5px; color: var(--ink-dim); margin-top: 4px; }
+  .track-stat.good .n { color: #4caf7d; }
+  .track-stat.warn .n { color: #d4940c; }
+  .track-stat.bad .n { color: #e05d5d; }
+
+  .track-charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-bottom: 20px; }
+  .track-card {
+    background: var(--panel-solid); border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px 20px;
+  }
+  .track-card h3 {
+    font-family: 'Fraunces', serif; font-weight: 600; font-size: 15.5px; color: var(--ink); margin: 0 0 14px;
+  }
+  .track-chart { width: 100%; }
+  .track-chart .track-empty { color: var(--ink-dim); font-size: 12.5px; text-align: center; padding: 30px 0; }
+  .track-legend { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-top: 12px; }
+  .track-legend-item { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--ink-dim); }
+  .track-legend-swatch { width: 8px; height: 8px; border-radius: 2px; flex-shrink: 0; }
+
+  .track-log-card { grid-column: 1 / -1; }
+  .track-table-wrap { overflow-x: auto; max-height: 480px; overflow-y: auto; border: 1px solid var(--line); border-radius: 10px; }
+  #track-log-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  #track-log-table thead th {
+    position: sticky; top: 0; background: var(--panel-solid); text-align: left; color: var(--ink-dim);
+    font-weight: 600; padding: 10px 14px; border-bottom: 1px solid var(--line); z-index: 1;
+  }
+  #track-log-table tbody td { padding: 8px 14px; border-bottom: 1px solid var(--line); color: var(--ink); white-space: nowrap; }
+  #track-log-table tbody tr:hover { background: var(--panel); }
+  .track-cache-badge {
+    display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 10.5px; font-weight: 700;
+    letter-spacing: 0.02em;
+  }
+  .track-cache-badge.HIT { background: rgba(76,175,125,0.15); color: #4caf7d; }
+  .track-cache-badge.MISS { background: rgba(94,150,224,0.15); color: #5e96e0; }
+  .track-cache-badge.STALE { background: rgba(212,148,12,0.15); color: #d4940c; }
+  .track-cache-badge.ERROR { background: rgba(224,93,93,0.15); color: #e05d5d; }
+
   @media (max-width: 700px) {
     .about-layout { flex-direction: column; padding-top: 0; gap: 0; }
     #toc {
@@ -221,6 +287,7 @@
     .toc-item.active { border-left: none; border-bottom-color: var(--accent); }
     .toc-item .toc-snippet { display: none; }
     #about-content { padding: 24px 16px 80px; }
+    .track-layout { padding: 20px 16px 60px; }
   }
 
   #loading-overlay {
@@ -233,13 +300,22 @@
   #loading-overlay[hidden] { display: none; }
 
   #idle-prompt {
+    /* Fixed dark scrim + fixed light text, deliberately NOT theme tokens —
+       this sits over the map itself (light or dark basemap either way),
+       so it needs to contrast against the map, not follow the chrome
+       palette. Using var(--ink) here was the bug: in the light day theme
+       that resolves to dark text on this same dark scrim — unreadable. */
     position: absolute; inset: 0; z-index: 4;
     display: flex; flex-direction: column; align-items: center; justify-content: center;
-    gap: 10px; background: rgba(6,10,19,0.55); color: var(--ink); text-align: center;
+    gap: 12px; background: rgba(8,12,22,0.72); color: #f6f1e6; text-align: center;
+    padding: 0 24px;
   }
-  #idle-prompt .icon { font-size: 34px; }
-  #idle-prompt p { margin: 0; font-family: 'Fraunces', serif; font-size: 17px; color: var(--ink); }
-  #idle-prompt span { font-size: 13px; color: var(--ink-dim); }
+  #idle-prompt .icon { font-size: 40px; }
+  #idle-prompt p {
+    margin: 0; font-family: 'Fraunces', serif; font-size: 21px; font-weight: 500;
+    color: #f6f1e6; text-wrap: balance; max-width: 480px;
+  }
+  #idle-prompt span { font-size: 14.5px; color: #b9c2d4; max-width: 420px; }
 
   .sun-loader {
     position: relative; width: 88px; height: 88px;
@@ -332,6 +408,11 @@
     font-size: 11.5px; color: var(--ink-dim); margin-top: 12px; padding: 8px 10px;
     background: var(--panel); border: 1px solid var(--line); border-radius: 8px; line-height: 1.4;
   }
+  .vd-stale-note {
+    font-size: 11.5px; color: #a8710a; margin-top: 12px; padding: 8px 10px;
+    background: rgba(168,113,10,0.1); border: 1px solid rgba(168,113,10,0.3);
+    border-radius: 8px; line-height: 1.4;
+  }
   .vd-info-row { font-size: 13.5px; margin: 8px 0; color: var(--ink); }
   .vd-info-row a { color: var(--accent-soft); }
   .vd-empty { font-size: 13px; color: var(--ink-dim); font-style: italic; }
@@ -376,6 +457,7 @@
   <div class="tabs">
     <button class="tab active" data-view="map">Map</button>
     <button class="tab" data-view="about">About</button>
+    <button class="tab" data-view="track">Track</button>
   </div>
 </header>
 
@@ -420,6 +502,51 @@
     <div class="about-layout">
       <nav id="toc"></nav>
       <div id="about-content">Loading…</div>
+    </div>
+  </div>
+  <div id="track-view" hidden>
+    <div class="track-layout">
+      <div class="track-header">
+        <h2>API traffic</h2>
+        <p>Every request this server makes to Overpass and DMI, and how often the local cache saved one — so it's visible if something starts spamming the upstream APIs.</p>
+        <div class="track-controls">
+          <div class="track-gran">
+            <button class="track-gran-btn active" data-granularity="hour">Hourly · 24h</button>
+            <button class="track-gran-btn" data-granularity="day">Daily · 14d</button>
+          </div>
+          <button id="track-refresh" class="track-refresh-btn">↻ Refresh</button>
+        </div>
+      </div>
+
+      <div id="track-summary" class="track-summary"></div>
+
+      <div class="track-charts">
+        <section class="track-card">
+          <h3>Venues &amp; buildings — per area</h3>
+          <div class="track-chart" id="chart-overpass"></div>
+          <div class="track-legend" id="legend-overpass"></div>
+        </section>
+        <section class="track-card">
+          <h3>Cloud forecast — per grid tile</h3>
+          <div class="track-chart" id="chart-forecast"></div>
+          <div class="track-legend" id="legend-forecast"></div>
+        </section>
+        <section class="track-card">
+          <h3>Weather observations — per station</h3>
+          <div class="track-chart" id="chart-weather"></div>
+          <div class="track-legend" id="legend-weather"></div>
+        </section>
+      </div>
+
+      <section class="track-card track-log-card">
+        <h3>Raw request log</h3>
+        <div class="track-table-wrap">
+          <table id="track-log-table">
+            <thead><tr><th>Time</th><th>Type</th><th>Detail</th><th>Cache</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
     </div>
   </div>
 </main>

@@ -52,6 +52,12 @@ OVERPASS_URLS = [
 DMI_OBS_URL = 'https://opendataapi.dmi.dk/v2/metObs/collections/observation/items'
 DMI_FORECAST_URL = 'https://opendataapi.dmi.dk/v1/forecastedr/collections/harmonie_dini_sf/position'
 
+# The only files this app ever intends to serve over HTTP. Everything else in
+# the project directory (server.py, CLAUDE.md, .git/, data/, .gitignore) must
+# stay unreachable — see the do_GET allowlist check for why this is an
+# allowlist and not a blocklist.
+PUBLIC_PATHS = {'/', '/index.html', '/app.js', '/readme.md'}
+
 # --- Hardening for running this publicly, not just on localhost --------
 #
 # These endpoints proxy to third-party APIs with no auth in front of them.
@@ -64,22 +70,63 @@ MAX_OVERPASS_BODY_BYTES = 20_000  # our real queries are a few hundred bytes
 ALLOWED_WEATHER_PARAMETERS = {'cloud_cover', 'temp_dry', 'wind_speed', 'wind_dir'}
 STATION_ID_RE = re.compile(r'^\d{4,6}$')
 RATE_LIMIT_WINDOW_SECONDS = 60
-RATE_LIMIT_MAX_REQUESTS = 30  # generous for legitimate multi-area use, not for scripted abuse
-
-_rate_limit_lock = threading.Lock()
-_rate_limit_hits = defaultdict(deque)  # client_ip -> deque of recent request timestamps
 
 
-def rate_limited(client_ip):
-    now = time.time()
-    with _rate_limit_lock:
-        hits = _rate_limit_hits[client_ip]
-        while hits and now - hits[0] > RATE_LIMIT_WINDOW_SECONDS:
-            hits.popleft()
-        if len(hits) >= RATE_LIMIT_MAX_REQUESTS:
-            return True
-        hits.append(now)
-        return False
+def make_rate_limiter(max_requests):
+    lock = threading.Lock()
+    hits = defaultdict(deque)  # client_ip -> deque of recent request timestamps
+
+    def check(client_ip):
+        now = time.time()
+        with lock:
+            q = hits[client_ip]
+            while q and now - q[0] > RATE_LIMIT_WINDOW_SECONDS:
+                q.popleft()
+            if len(q) >= max_requests:
+                return True
+            q.append(now)
+            return False
+    return check
+
+
+# Two separate budgets, not one shared one — they were originally one
+# (RATE_LIMIT_MAX_REQUESTS = 30 for everything), which broke real usage: a
+# single area load fans out into an Overpass call, several per-tile forecast
+# calls, and a few observation calls, and static page-load/tab-switch
+# requests were sharing that same 30/min ceiling once those got rate-limited
+# too — confirmed live, a single area load followed by opening the About tab
+# tripped the limit and readme.md failed to fetch. What actually matters for
+# *external* safety is capping the calls that cost a real third-party
+# request (Overpass/DMI) — that budget stays tight. Static files and
+# /api/logs never leave this server, so they get a much more generous
+# budget purely to blunt basic flooding, not to constrain legitimate use.
+api_rate_limited = make_rate_limiter(30)      # protects the Overpass/DMI proxies specifically
+static_rate_limited = make_rate_limiter(120)  # protects the server itself from flooding
+
+# HARMONIE DINI's native resolution is ~2km — querying at a venue's exact
+# coordinate buys no real accuracy over querying at the cell it falls in, but
+# it does mean every venue in an area would otherwise be a separate cache
+# entry and a separate upstream request. Snapping to this grid before caching
+# means venues (even across different areas) that land in the same cell share
+# one cache file and one DMI request.
+FORECAST_GRID_LAT_STEP = 0.018   # ~2km of latitude
+FORECAST_GRID_LON_STEP = 0.032   # ~2km of longitude at Copenhagen's latitude
+
+_forecast_fetch_locks = defaultdict(threading.Lock)
+_forecast_fetch_locks_guard = threading.Lock()
+
+
+def snap_to_forecast_grid(lat, lon):
+    snapped_lat = round(lat / FORECAST_GRID_LAT_STEP) * FORECAST_GRID_LAT_STEP
+    snapped_lon = round(lon / FORECAST_GRID_LON_STEP) * FORECAST_GRID_LON_STEP
+    return round(snapped_lat, 4), round(snapped_lon, 4)
+
+
+def _forecast_lock_for(key):
+    # A dict of per-key locks so concurrent requests for *different* cells
+    # don't block each other, only requests racing for the *same* cell do.
+    with _forecast_fetch_locks_guard:
+        return _forecast_fetch_locks[key]
 
 
 def valid_latlon(value, lo, hi):
@@ -91,6 +138,63 @@ def valid_latlon(value, lo, hi):
 
 
 os.makedirs(DATA_DIR, exist_ok=True)
+
+# --- API call log (for the "Track" tab) ---------------------------------
+#
+# Every proxied request (Overpass venues/buildings, DMI forecast tiles, DMI
+# observation stations) gets one line appended here, regardless of whether
+# it was served from cache — the whole point is to make cache effectiveness
+# (and any accidental spamming) visible, not just successful fetches.
+LOG_PATH = os.path.join(DATA_DIR, 'api_log.jsonl')
+MAX_LOG_BYTES = 5 * 1024 * 1024  # trim well before this becomes slow to parse
+LOG_TRIM_KEEP_LINES = 10_000
+_log_lock = threading.Lock()
+
+
+def log_api_call(kind, detail, cache_status):
+    entry = {'ts': datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z'),
+              'kind': kind, 'cache': cache_status, **detail}
+    line = json.dumps(entry) + '\n'
+    with _log_lock:
+        try:
+            if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > MAX_LOG_BYTES:
+                with open(LOG_PATH, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()[-LOG_TRIM_KEEP_LINES:]
+                with open(LOG_PATH, 'w', encoding='utf-8') as f:
+                    f.writelines(lines)
+            with open(LOG_PATH, 'a', encoding='utf-8') as f:
+                f.write(line)
+        except OSError as err:
+            print('Warning: failed to write api log', err)
+
+
+def read_log_entries(limit):
+    if not os.path.exists(LOG_PATH):
+        return []
+    try:
+        with open(LOG_PATH, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+    entries = []
+    for line in lines[-limit:]:
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return entries
+
+
+# Only used for the log's own query-string fields (areaId, kind), which are
+# never trusted for anything but display. app.js's Track tab already
+# HTML-escapes every log field before rendering it, but validating here too
+# (rather than relying on that alone) means a client sending garbage can't
+# even get it written to the log file, let alone pollute the charts/table.
+_LOG_FIELD_RE = re.compile(r'^[a-zA-Z0-9_-]{1,60}$')
+
+
+def log_field(value):
+    return value if value and _LOG_FIELD_RE.match(value) else ''
 
 
 def cache_path(prefix, key):
@@ -226,8 +330,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         return self.client_address[0]
 
     def do_POST(self):
-        if self.path == '/api/overpass':
-            if rate_limited(self._client_ip()):
+        if self.path.startswith('/api/overpass'):
+            if api_rate_limited(self._client_ip()):
                 self._send_error_json(429, 'Too many requests')
                 return
 
@@ -243,33 +347,57 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             query = self.rfile.read(length).decode('utf-8', errors='replace')
             path = cache_path('overpass', query)
 
+            # areaId/kind are for the Track tab's logging only — never part of
+            # the cache key, and never trusted beyond display.
+            qs = parse_qs(urlparse(self.path).query)
+            log_detail = {
+                'areaId': log_field(qs.get('areaId', [''])[0]),
+                'requestKind': log_field(qs.get('kind', [''])[0])
+            }
+
             cached = read_cache(path, OVERPASS_CACHE_TTL_SECONDS)
             if cached is not None:
+                log_api_call('overpass', log_detail, 'HIT')
                 self._send_json(200, cached, 'HIT')
                 return
 
             try:
                 body = fetch_overpass(query)
                 write_cache(path, body)
+                log_api_call('overpass', log_detail, 'MISS')
                 self._send_json(200, body, 'MISS')
             except Exception as err:
                 stale = read_stale_cache(path)
                 if stale is not None:
                     print('Overpass fetch failed, serving stale cache', path, err, flush=True)
+                    log_api_call('overpass', log_detail, 'STALE')
                     self._send_json(200, stale, 'STALE')
                 else:
                     print('Overpass fetch failed, no stale cache available', path, err, flush=True)
+                    log_api_call('overpass', log_detail, 'ERROR')
                     self._send_error_json(502, 'Upstream request failed')
             return
 
         self.send_error(404)
 
     def do_GET(self):
-        if self.path.startswith('/api/forecast'):
-            if rate_limited(self._client_ip()):
+        # Every GET is rate-limited — static files included, not just
+        # /api/forecast/weather — so basic request-flooding can't dodge the
+        # limit just by hitting a non-API path (confirmed before this fix:
+        # 40/40 rapid requests to /index.html returned 200 with zero
+        # throttling). Which budget applies depends on whether the route
+        # costs a real upstream Overpass/DMI request or not — see
+        # api_rate_limited/static_rate_limited above.
+        is_upstream_route = self.path.startswith('/api/forecast') or self.path.startswith('/api/weather')
+        limiter = api_rate_limited if is_upstream_route else static_rate_limited
+        if limiter(self._client_ip()):
+            if self.path.startswith('/api/'):
                 self._send_error_json(429, 'Too many requests')
-                return
+            else:
+                self.send_error(429, 'Too many requests')
+            return
 
+        if self.path.startswith('/api/forecast'):
             qs = parse_qs(urlparse(self.path).query)
             # Denmark-ish bounding box — generous, just enough to catch garbage/injection
             # attempts rather than to be a precise territorial check.
@@ -278,32 +406,48 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             if lat is None or lon is None:
                 self._send_error_json(400, 'Invalid lat/lon')
                 return
-            path = cache_path('forecast', f'{lat},{lon}')
+
+            snapped_lat, snapped_lon = snap_to_forecast_grid(lat, lon)
+            key = f'{snapped_lat},{snapped_lon}'
+            path = cache_path('forecast', key)
+            log_detail = {'cell': key}
 
             cached = read_cache(path, FORECAST_CACHE_TTL_SECONDS)
             if cached is not None:
+                log_api_call('forecast', log_detail, 'HIT')
                 self._send_json(200, cached, 'HIT')
                 return
 
-            try:
-                body = fetch_dmi_forecast_cloud_cover(lat, lon)
-                write_cache(path, body)
-                self._send_json(200, body, 'MISS')
-            except Exception as err:
-                stale = read_stale_cache(path)
-                if stale is not None:
-                    print('DMI forecast fetch failed, serving stale cache', path, err, flush=True)
-                    self._send_json(200, stale, 'STALE')
-                else:
-                    print('DMI forecast fetch failed, no stale cache available', path, err, flush=True)
-                    self._send_error_json(502, 'Upstream request failed')
+            # Per-venue querying means many requests can land on the same grid
+            # cell within milliseconds of each other (a whole area's worth of
+            # venues loading at once) — without this lock they'd all miss the
+            # not-yet-written cache and fire off duplicate DMI requests, which
+            # is exactly the rate-limit stampede the grid-snapping is meant to
+            # avoid in the first place.
+            with _forecast_lock_for(key):
+                cached = read_cache(path, FORECAST_CACHE_TTL_SECONDS)
+                if cached is not None:
+                    log_api_call('forecast', log_detail, 'HIT')
+                    self._send_json(200, cached, 'HIT')
+                    return
+                try:
+                    body = fetch_dmi_forecast_cloud_cover(snapped_lat, snapped_lon)
+                    write_cache(path, body)
+                    log_api_call('forecast', log_detail, 'MISS')
+                    self._send_json(200, body, 'MISS')
+                except Exception as err:
+                    stale = read_stale_cache(path)
+                    if stale is not None:
+                        print('DMI forecast fetch failed, serving stale cache', path, err, flush=True)
+                        log_api_call('forecast', log_detail, 'STALE')
+                        self._send_json(200, stale, 'STALE')
+                    else:
+                        print('DMI forecast fetch failed, no stale cache available', path, err, flush=True)
+                        log_api_call('forecast', log_detail, 'ERROR')
+                        self._send_error_json(502, 'Upstream request failed')
             return
 
         if self.path.startswith('/api/weather'):
-            if rate_limited(self._client_ip()):
-                self._send_error_json(429, 'Too many requests')
-                return
-
             qs = parse_qs(urlparse(self.path).query)
             station_id = qs.get('stationId', [''])[0]
             parameter_id = qs.get('parameterId', ['cloud_cover'])[0]
@@ -314,27 +458,59 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 self._send_error_json(400, 'Invalid parameterId')
                 return
             path = cache_path('weather', f'{parameter_id}|{station_id}')
+            log_detail = {'stationId': station_id, 'parameterId': parameter_id}
 
             cached = read_cache(path, WEATHER_CACHE_TTL_SECONDS)
             if cached is not None:
+                log_api_call('weather', log_detail, 'HIT')
                 self._send_json(200, cached, 'HIT')
                 return
 
             try:
                 body = fetch_dmi(station_id, parameter_id)
                 write_cache(path, body)
+                log_api_call('weather', log_detail, 'MISS')
                 self._send_json(200, body, 'MISS')
             except Exception as err:
                 stale = read_stale_cache(path)
                 if stale is not None:
                     print('DMI fetch failed, serving stale cache', path, err, flush=True)
+                    log_api_call('weather', log_detail, 'STALE')
                     self._send_json(200, stale, 'STALE')
                 else:
                     print('DMI fetch failed, no stale cache available', path, err, flush=True)
+                    log_api_call('weather', log_detail, 'ERROR')
                     self._send_error_json(502, 'Upstream request failed')
             return
 
-        super().do_GET()
+        if self.path.startswith('/api/logs'):
+            qs = parse_qs(urlparse(self.path).query)
+            try:
+                limit = min(max(int(qs.get('limit', ['5000'])[0]), 1), 10_000)
+            except ValueError:
+                limit = 5000
+            entries = read_log_entries(limit)
+            self._send_json(200, json.dumps({'entries': entries}), 'N/A')
+            return
+
+        # Everything else must be an exact match against the small, fixed set
+        # of files this app actually intends to serve. This is an allowlist,
+        # not a blocklist, on purpose — a blocklist (deny .git/, deny data/,
+        # deny server.py, ...) is exactly the kind of thing that's fine until
+        # the next file is added and someone forgets to extend it. This was a
+        # real, confirmed vulnerability before this fix: with plain
+        # SimpleHTTPRequestHandler serving the whole project directory,
+        # anyone could browse a live directory listing of data/ (every
+        # cached Overpass/DMI response plus the *entire* unbounded
+        # api_log.jsonl, bypassing /api/logs' own size cap), download
+        # server.py's full source, and pull the whole .git/ history
+        # (.git/config, .git/HEAD, .git/logs/HEAD all returned 200) —
+        # confirmed live with curl, not theoretical.
+        url_path = urlparse(self.path).path
+        if url_path in PUBLIC_PATHS:
+            super().do_GET()
+            return
+        self.send_error(404)
 
 
 if __name__ == '__main__':

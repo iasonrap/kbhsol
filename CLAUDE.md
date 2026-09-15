@@ -165,6 +165,21 @@ No build step, no bundler, no npm — everything loads from CDNs
   "Cloud X%" figure is now an average across the area's distinct cells
   (`avgCloudCover` in `loadArea`); a venue's own detail panel shows its
   own cell's reading, which can legitimately differ from that average.
+- **`fetch_dmi_forecast_cloud_cover`'s retry budget (`server.py`) is
+  deliberately tight — `retries=2`, 2s/4s backoff, worst case ~6s.** It
+  used to be `retries=4` with a 3/6/9/12s backoff (worst case ~30s),
+  tuned back when only one forecast call happened per area load. Since
+  the per-venue grid-tiling change above, an area load fires one call
+  per distinct grid cell *in parallel*, so when DMI is genuinely
+  rate-limiting, every one of those parallel calls pays the same
+  worst-case tax independently and the user is stuck on the loading
+  overlay for as long as the *slowest* one takes — confirmed live at
+  over 60s (once even 150s) during a real DMI 429 spell, which is
+  exactly what read as "an error on the map" even though nothing had
+  actually crashed. Don't raise this back up without re-checking that
+  math — the stale-cache fallback is already a good answer within its
+  60-minute TTL, so failing into it fast matters more than marginally
+  fresher data bought with a much longer hang.
 - **The UI theme (dark by default, light "day" theme while the sun's up in
   Copenhagen) is driven by `computeTheme()`/`switchTheme()` in `app.js`,
   toggling `document.documentElement.dataset.theme` and swapping the
@@ -234,19 +249,33 @@ No build step, no bundler, no npm — everything loads from CDNs
   catch-all fallback**, and never add a whole directory to it (that
   reopens the `data/`-style listing risk for whatever else ends up in
   that directory later).
-- **Rate limiting is two separate budgets, not one shared one** —
-  `api_rate_limited` (30/min, protects the Overpass/DMI proxies
-  specifically) and `static_rate_limited` (120/min, protects the server
-  itself — static files and `/api/logs`, neither of which costs an
-  upstream call). They used to be one shared 30/min bucket covering
-  everything, which broke real usage: a single area load fans out into
-  an Overpass call plus several per-tile forecast calls plus a few
-  observation calls, and once static file requests started sharing that
-  same budget, a normal single-session flow (load the page, pick an
-  area, open the About tab) could exhaust it before `readme.md` even
-  fetched — confirmed live, not theoretical. If you add a new route,
-  decide which budget it belongs to based on whether it costs a real
-  third-party request, not by default/habit.
+- **Rate limiting is two separate budgets, not one shared one, and both
+  are 120/min** — `api_rate_limited` protects the Overpass/DMI proxies
+  specifically; `static_rate_limited` protects the server itself (static
+  files and `/api/logs`, neither of which costs an upstream call). They
+  used to be one shared 30/min bucket covering everything, which broke
+  real usage: a single area load fans out into an Overpass call plus
+  several per-tile forecast calls plus a few observation calls, and once
+  static file requests started sharing that same budget, a normal
+  single-session flow (load the page, pick an area, open the About tab)
+  could exhaust it before `readme.md` even fetched — confirmed live, not
+  theoretical. Splitting the budgets wasn't enough on its own, either:
+  `api_rate_limited` was left at 30/min after the split and *still* broke
+  real usage a second time, confirmed live again — one area load alone
+  costs ~7-10 of those requests, so loading even 3-4 areas back to back
+  (completely normal use of the multi-select area picker, not abuse)
+  exhausted it, and every area after that failed with a misleading
+  "Overpass API may be busy" message — misleading because the 429 was
+  this server's own limiter, not Overpass. Fixed two ways: raised
+  `api_rate_limited` to 120/min (comfortably covers all ten areas back
+  to back), and `fetchOverpass` in `app.js` now tags a 429 response with
+  `err.ownRateLimit = true` so `loadArea`'s catch block can show an
+  accurate message instead of blaming Overpass for something Overpass
+  didn't do. If you add a new route, decide which budget it belongs to
+  based on whether it costs a real third-party request, not by
+  default/habit — and if you ever need to lower either budget again,
+  load-test actual multi-area usage first, not just a single area, since
+  that's what broke this twice.
 
 - **The "Track" tab (third header tab, alongside Map/About) visualizes every
   proxied API call** — Overpass venues/buildings per area, DMI forecast per
@@ -269,6 +298,81 @@ No build step, no bundler, no npm — everything loads from CDNs
   can't affect the cache key. Charts are hand-rolled inline SVG (no charting
   library) to match the project's no-dependency pattern — see
   `renderStackedBarSVG` in `app.js`.
+- **Phone layout lives in exactly one `@media (max-width: 700px)` block,
+  placed at the very end of `index.html`'s `<style>`, after every base
+  rule it overrides.** This is a hard rule, not a preference — CSS
+  resolves same-specificity ties by source order, so a media-query
+  override placed *earlier* in the file than the base rule it's meant to
+  override loses to it regardless of viewport width, silently. This bit
+  twice while building this section, both confirmed live, not
+  theoretical: (1) an earlier draft put the `#venue-detail`/`footer`
+  mobile overrides inside the *other*, earlier `@media` block that used
+  to exist further up the file — `#venue-detail`'s `width:100%` override
+  lost to the later `width:320px` base rule, so the drawer only ever
+  rendered ~320px wide even on a 390px screen; (2) `#toc`'s base rule
+  sets `flex: 0 0 210px` to size the desktop sidebar's *width*
+  (`.about-layout` is a row there) — the mobile override flips
+  `.about-layout` to `flex-direction: column`, which flips which axis
+  `flex-basis` sizes too, so that same `210px` silently became the
+  mobile TOC bar's *height* instead of doing nothing; it rendered 231px
+  tall with its pills vertically centered in dead space until an
+  explicit `flex: 0 0 auto` override fixed it. **Both classes of bug are
+  invisible unless you actually screenshot at a real phone viewport
+  width — resizing a desktop browser window doesn't reliably reproduce
+  either one.** If you add a new mobile rule, add it to this one
+  end-of-file block, not a new one, and verify it live at 390px and
+  320px widths, not just by reading the CSS.
+- **Area selection is a dropdown only below 700px** (`#area-dropdown-toggle`
+  / `.open` classes in `app.js`) — desktop keeps the always-visible pill
+  row (`#area-dropdown-toggle` stays `display:none` there). The dropdown
+  panel is `position:absolute` and overlays the map while open, which is
+  correct dropdown behavior, but means clicks on it can be mistaken for
+  clicks on the map underneath if a test script (or a user) doesn't
+  close it first — confirmed while testing this: leaving it open and
+  then "clicking around the map center" actually hammered several
+  different area-box buttons stacked in that same screen region,
+  triggering a burst of unrelated `loadArea`/`unloadArea` calls. Always
+  close the dropdown (tap the toggle again, or let the outside-click
+  handler catch it) before interacting with the map underneath.
+- **The About page's desktop "Apple product page" effect (each `##`
+  section forced to a full viewport-height slide via `sizeChapters()`'s
+  inline `min-height`, fading in via scroll-snap) is switched off
+  entirely below 700px**, not just resized — it's a bad mobile fit,
+  since most chapters don't have a full screen's worth of content at
+  phone width, which read as mostly-empty space with a barely-visible
+  ghost of the next section peeking in ("doesn't look very responsive",
+  a real complaint that led to this). The mobile override
+  (`.chapter { min-height: auto !important; opacity: 1 !important;
+  transform: none !important; }`) has to use `!important` since
+  `sizeChapters()` sets `min-height` as an inline style, which nothing
+  but `!important` in a stylesheet can beat. Mobile gets a normal,
+  continuously-flowing article instead; the TOC's active-chapter
+  tracking still works unchanged, since `observeChapters()`'s
+  IntersectionObserver was never height-dependent. The desktop slide
+  effect itself is untouched.
+- **`#panel` (the top-left stats overlay) is collapsible** — a real,
+  user-reported problem: with several areas selected at once, the
+  per-area rows stack up and the panel can grow tall enough to cover
+  most of the map. `#panel-toggle` (the small ‹/› tab clipped half
+  outside its edge) toggles a `.collapsed` class on `#panel` itself,
+  which shrinks the whole box down to just that tab. **The toggle
+  button lives in `index.html` as a persistent sibling of
+  `#panel-content`, not inside the markup `renderPanel()` rewrites** —
+  `renderPanel()` reruns on every area load/unload/refresh, so if the
+  toggle (or the collapsed state) lived inside the HTML it replaces,
+  collapsing the panel would silently un-collapse itself the next time
+  any area's data changed. Confirmed live that the collapsed state
+  survives a fresh area load. If you touch `renderPanel()`, target
+  `panelContent.innerHTML`, never `panel.innerHTML` — the latter would
+  wipe out the toggle button entirely.
+  **The tab sits on the panel's right edge on desktop but the left edge
+  on mobile** (`#panel-toggle { left: -13px; right: auto; }` in the
+  end-of-file phone block) — another real, user-reported bug: on a
+  phone the panel spans nearly the full width, so a right-edge toggle
+  landed directly under MapLibre's zoom +/-/compass control, which also
+  sits top-right. Confirmed live with bounding-box coordinates that the
+  two no longer overlap at any panel width, collapsed or not. If the
+  map's own control position ever changes, recheck this.
 
 ## Testing changes
 

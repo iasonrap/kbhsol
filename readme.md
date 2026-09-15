@@ -129,7 +129,12 @@ layer entirely.
   slide that fades/slides into view as you reach it (similar to Apple's
   product pages) — a sidebar table of contents on the left tracks your
   position, expanding the current chapter's title with a short preview
-  and collapsing the rest. Click a chapter to jump straight to it.
+  and collapsing the rest. Click a chapter to jump straight to it. On a
+  phone, this becomes a normal continuously-flowing article instead — the
+  full-screen slide effect doesn't suit most chapters' actual content
+  length at that width — with the same table of contents as a horizontal
+  row of tappable pill chips underneath the header, still tracking which
+  section you're reading as you scroll.
 - **Track** shows every API call this server has made to Overpass and DMI,
   and whether the local cache absorbed it — a stat row (total requests,
   cache hits, real upstream calls, hit rate, errors), then three charts
@@ -142,7 +147,10 @@ layer entirely.
 - Below the header is the area bar. On open, the map shows a wide view
   of Copenhagen and loads nothing — pick one or more of ten
   neighborhoods (Vesterbro, Frederiksberg, Nordvest, Bispebjerg,
-  Nørrebro, Indre By, Østerbro, Nordhavn, Christiania, Amagerbro).
+  Nørrebro, Indre By, Østerbro, Nordhavn, Christiania, Amagerbro). On a
+  phone this collapses into a "Select areas" dropdown that expands into
+  the same tappable list — still multi-select, just tucked away instead
+  of permanently taking up a row under the header.
 - Clicking an area toggles it on (loads its data) or off (removes it from
   the map) — you can have several areas active at once, and the panel
   aggregates counts across all of them.
@@ -206,6 +214,11 @@ layer entirely.
     so it's often missing.
 - The panel in the top-left shows the current time, sun altitude,
   cloud cover %, and a running count of venues across all six states.
+  With several areas selected at once it can grow tall enough to cover
+  a good chunk of the map — the small ‹ tab on its right edge collapses
+  it down to just that tab (click again, now ›, to bring it back), and
+  it stays collapsed even as area data keeps loading/refreshing behind
+  it.
 - If OpenStreetMap's Overpass API is temporarily down, you'll see a
   "Could not load map data" message with a retry button instead of a
   silent hang.
@@ -258,12 +271,21 @@ layer entirely.
   they're hardened against being used as an open relay — per-IP rate
   limiting, a body-size cap on Overpass queries, an allowlist for
   `parameterId`, and bounds-checked `lat`/`lon`. Rate limiting is two
-  separate budgets: 30 requests/minute for the routes that cost a real
-  Overpass/DMI call, and a more generous 120/minute for static files and
+  separate budgets: 120 requests/minute for the routes that cost a real
+  Overpass/DMI call, and the same 120/minute for static files and
   `/api/logs` (which never leave this server) — otherwise a single normal
   area load's fan-out of Overpass/forecast/observation calls could exhaust
   a shared budget and start blocking your own next page load, which is
-  exactly what happened during testing before they were split.
+  exactly what happened during testing before they were split. The
+  Overpass/DMI budget started at 30/min and had to be raised — one area
+  load alone costs roughly 7-10 of those requests (Overpass venues +
+  buildings, a few observation calls, several forecast tiles), and
+  loading multiple areas back to back is a normal way to use the
+  multi-select area picker, not abuse; 30/min meant loading 3-4 areas in
+  quick succession could exhaust it, and every area after that failed
+  with a misleading "Overpass API may be busy" — misleading because the
+  429 was this server's own limiter, not Overpass. Both a real bug found
+  live, not in review.
   `ThreadingHTTPServer` is used instead of plain `HTTPServer` so one slow
   client can't block every other request. None of this is a substitute
   for real auth if this ever needs to be more than a personal tool on the

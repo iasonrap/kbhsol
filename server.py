@@ -97,10 +97,18 @@ def make_rate_limiter(max_requests):
 # too — confirmed live, a single area load followed by opening the About tab
 # tripped the limit and readme.md failed to fetch. What actually matters for
 # *external* safety is capping the calls that cost a real third-party
-# request (Overpass/DMI) — that budget stays tight. Static files and
-# /api/logs never leave this server, so they get a much more generous
-# budget purely to blunt basic flooding, not to constrain legitimate use.
-api_rate_limited = make_rate_limiter(30)      # protects the Overpass/DMI proxies specifically
+# request (Overpass/DMI) — that budget stays tight, but not *this* tight:
+# 30/min was still too low even after the split, confirmed live a second
+# time — one area load alone costs ~7-10 of these (2 Overpass + 3 weather +
+# 2-5 forecast tiles), and multi-select area browsing is a real, intended
+# feature of this app, not abuse. Loading 3-4 areas in quick succession
+# exhausted the budget and every area after that failed with "Overpass API
+# may be busy," which was our own rate limiter, not Overpass — a doubly
+# misleading failure (see fetchOverpass's ownRateLimit tag in app.js,
+# which exists specifically to stop this from being misattributed again).
+# 120/min comfortably covers loading all ten areas back to back while still
+# bounding runaway/scripted abuse well below what a real one is capable of.
+api_rate_limited = make_rate_limiter(120)     # protects the Overpass/DMI proxies specifically
 static_rate_limited = make_rate_limiter(120)  # protects the server itself from flooding
 
 # HARMONIE DINI's native resolution is ~2km — querying at a venue's exact
@@ -266,14 +274,28 @@ def _parse_iso(t):
     return datetime.strptime(t, '%Y-%m-%dT%H:%M:%S.%fZ').replace(tzinfo=timezone.utc)
 
 
-def fetch_dmi_forecast_cloud_cover(lat, lon, retries=4):
+def fetch_dmi_forecast_cloud_cover(lat, lon, retries=2):
     """Cloud cover from DMI's HARMONIE DINI forecast model (2km grid), read at the
     nearest available hour to now. Used instead of the sparse observation stations
     because the model gives genuinely different values area-to-area (~2km resolution)
     where only two-ish observation stations cover all of central Copenhagen.
 
     This endpoint rate-limits more aggressively than the observation API — retry
-    with backoff rather than erroring out on the first 429."""
+    with backoff rather than erroring out on the first 429.
+
+    retries=2 (worst case ~6s of backoff) is deliberately much lower than the
+    weather/overpass proxies' own retry budgets — this used to be retries=4
+    with a 3/6/9/12s backoff (worst case ~30s) from when only one forecast
+    call happened per area load. Since the per-venue grid-tiling change,
+    an area load fires off one call per distinct grid cell *in parallel*
+    (Promise.all in fetchVenueForecasts), so when DMI is genuinely
+    rate-limiting hard, every one of those parallel calls pays this same
+    worst-case tax independently, and the user is stuck looking at the
+    loading overlay for however long the *slowest* one takes — confirmed
+    live at over 60s total with the old budget during a real DMI 429
+    spell. The stale-cache fallback is already a good answer within its
+    60-minute TTL, so failing fast into it beats making someone wait
+    a full minute for marginally fresher data."""
     url = (f'{DMI_FORECAST_URL}?coords={quote(f"POINT({lon} {lat})")}'
            f'&parameter-name=fraction-of-cloud-cover&crs=crs84')
     req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
@@ -282,14 +304,14 @@ def fetch_dmi_forecast_cloud_cover(lat, lon, retries=4):
     data = None
     for attempt in range(retries + 1):
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode('utf-8'))
             break
         except Exception as err:
             print('DMI forecast attempt failed', err, flush=True)
             last_err = err
             if attempt < retries:
-                time.sleep(3 * (attempt + 1))
+                time.sleep(2 * (attempt + 1))
     if data is None:
         raise last_err
 

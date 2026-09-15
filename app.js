@@ -67,6 +67,19 @@ function cloudTierState(cloudCover) {
 const SHADOW_RAY_METERS = 200;    // how far to search for occluding buildings
 
 const panel = document.getElementById('panel');
+const panelContent = document.getElementById('panel-content');
+const panelToggle = document.getElementById('panel-toggle');
+
+// Collapse state is deliberately kept on the persistent #panel-toggle button
+// rather than rebuilt inside renderPanel()'s innerHTML — that function reruns
+// on every area load/unload, and if the collapse toggle lived inside the
+// HTML it replaces, collapsing the panel would silently un-collapse itself
+// the next time any area's data refreshed.
+panelToggle.addEventListener('click', () => {
+  const collapsed = panel.classList.toggle('collapsed');
+  panelToggle.textContent = collapsed ? '›' : '‹';
+  panelToggle.setAttribute('aria-label', collapsed ? 'Expand panel' : 'Collapse panel');
+});
 
 // --- Tabs (Map / About / Track) -----------------------------------------
 
@@ -78,7 +91,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     document.getElementById('map-view').hidden = view !== 'map';
     document.getElementById('about-view').hidden = view !== 'about';
     document.getElementById('track-view').hidden = view !== 'track';
-    document.getElementById('area-bar').hidden = view !== 'map';
+    document.getElementById('area-select').hidden = view !== 'map';
     if (view === 'track') loadTrackData();
   });
 });
@@ -411,7 +424,18 @@ async function fetchOverpass(query, areaId, kind) {
   // cache key (which is the raw query text only).
   const url = `/api/overpass?areaId=${encodeURIComponent(areaId)}&kind=${encodeURIComponent(kind)}`;
   const res = await fetch(url, { method: 'POST', body: query });
-  if (!res.ok) throw new Error(`Overpass proxy responded ${res.status}`);
+  if (!res.ok) {
+    const err = new Error(`Overpass proxy responded ${res.status}`);
+    // A 429 here is our OWN server's rate limiter, not Overpass itself —
+    // confirmed as a real, confusing case live: loading several areas in
+    // quick succession (a normal way to use a multi-select area picker)
+    // exhausted the shared api budget, and every subsequent area's load
+    // failed with "Overpass API may be busy," which is simply untrue and
+    // points the user at the wrong system entirely. Tag it so the caller
+    // can say what's actually happening.
+    err.ownRateLimit = res.status === 429;
+    throw err;
+  }
   return res.json();
 }
 
@@ -1297,7 +1321,7 @@ function renderPanel() {
   const inSun = total.sun + total['partly-sunny'];
   const inShade = total['building-shade'] + total['partly-cloudy'] + total.cloudy + total.night;
 
-  panel.innerHTML = `
+  panelContent.innerHTML = `
     ${areaRows}
     <div class="hero-stats">
       <div class="hero-stat"><div class="num">${inSun}</div><div class="lbl">In sun</div></div>
@@ -1337,7 +1361,12 @@ async function loadArea(areaId) {
     console.error('Failed to load OSM data', err);
     pendingLoads--;
     document.querySelector(`[data-area="${areaId}"]`).classList.remove('active');
-    if (pendingLoads === 0) showLoadingError('Could not load map data from OpenStreetMap — the Overpass API may be busy.');
+    if (pendingLoads === 0) {
+      const message = err.ownRateLimit
+        ? "You're loading areas faster than this server's own request budget resets — give it a few seconds and try again."
+        : 'Could not load map data from OpenStreetMap — the Overpass API may be busy.';
+      showLoadingError(message);
+    }
     return;
   }
 
@@ -1454,6 +1483,33 @@ themeToggle.addEventListener('click', () => {
   updateThemeToggleIcon();
 });
 
+// On phone widths #area-bar becomes a collapsible dropdown (see the mobile
+// media query in index.html) — desktop ignores all of this since
+// #area-dropdown-toggle stays display:none there, and .open never gets
+// added by anything but this click handler.
+const areaDropdownToggle = document.getElementById('area-dropdown-toggle');
+const areaDropdownLabel = document.getElementById('area-dropdown-label');
+const areaBarEl = document.getElementById('area-bar');
+
+function updateAreaDropdownLabel() {
+  const active = document.querySelectorAll('.area-box.active');
+  if (active.length === 0) areaDropdownLabel.textContent = 'Select areas';
+  else if (active.length === 1) areaDropdownLabel.textContent = active[0].textContent;
+  else areaDropdownLabel.textContent = `${active.length} areas selected`;
+}
+
+areaDropdownToggle.addEventListener('click', () => {
+  const open = areaBarEl.classList.toggle('open');
+  areaDropdownToggle.classList.toggle('open', open);
+});
+
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('#area-select')) {
+    areaBarEl.classList.remove('open');
+    areaDropdownToggle.classList.remove('open');
+  }
+});
+
 document.querySelectorAll('.area-box').forEach(box => {
   box.addEventListener('click', () => {
     const areaId = box.dataset.area;
@@ -1464,5 +1520,6 @@ document.querySelectorAll('.area-box').forEach(box => {
     } else {
       unloadArea(areaId);
     }
+    updateAreaDropdownLabel();
   });
 });

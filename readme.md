@@ -202,7 +202,12 @@ your laptop to use the app there too, no extra setup needed.
     the area (different *areas* do get different stations, e.g. Nordvest
     nearest to Jægersborg, Christiania nearest to Kastrup, since the
     city's inner stations each only report a partial set of parameters
-    and the fully-equipped ones sit on the outskirts). Cloud cover,
+    and the fully-equipped ones sit on the outskirts). The panel shows
+    exactly when that reading was taken ("Temp/wind observed at…") right
+    alongside the cloud forecast's own timestamp, since the two come from
+    different DMI APIs that update on different schedules — the station
+    reports every 10 minutes, the forecast picks the nearest hourly step
+    — so they're rarely the same moment. Cloud cover,
     though, *is* per-venue — it's this specific venue's own forecast
     grid-cell reading, which can differ from the area-wide average shown
     in the top-left panel if the venue sits near the edge of its area.
@@ -225,7 +230,11 @@ your laptop to use the app there too, no extra setup needed.
     than silently vanishing — coverage is crowd-sourced and inconsistent,
     so it's often missing.
 - The panel in the top-left shows the current time, sun altitude,
-  cloud cover %, and a running count of venues across all six states.
+  "Cloud forecast for area" %, and a running count of venues across all
+  six states. That % is explicitly labeled as an area-wide figure (an
+  average across the area's distinct forecast grid cells) since a
+  venue's own detail panel shows its own cell's reading, which can
+  legitimately differ from this average near an area's edges.
   With several areas selected at once it can grow tall enough to cover
   a good chunk of the map — the small ‹ tab on its right edge collapses
   it down to just that tab (click again, now ›, to bring it back), and
@@ -237,9 +246,13 @@ your laptop to use the app there too, no extra setup needed.
 - If DMI's weather API is temporarily rate-limited, the app falls back to
   the last cached reading rather than erroring — but it tells you: a
   small ⚠️ appears next to the cloud % in the area panel, and the venue
-  detail panel shows an amber note explaining the data may be several
-  hours old, so a mismatch (like a forecast timestamped hours away from
-  the current time) is never silently confusing.
+  detail panel shows an amber note, so a mismatch (like a forecast
+  timestamped hours away from the current time) is never silently
+  confusing. Cloud cover and temperature/wind are two separate DMI calls
+  that fail independently — DMI's forecast API rate-limits noticeably
+  harder than its observation one — so each gets its own note (☁️ for
+  cloud, 🌡️ for temp/wind) naming which specific reading is the cached
+  one, rather than one combined "something's stale" message.
 
 ## Known limitations
 

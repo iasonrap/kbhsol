@@ -103,14 +103,39 @@ No build step, no bundler, no npm — everything loads from CDNs
   rather than hard-erroring. Don't remove this without good reason — it's
   what keeps the app usable when the public Overpass mirrors are flaky
   (which happens often). The server marks these responses `X-Cache: STALE`
-  and the client checks that header (`fetchWeather`'s `forecastStale`/
-  `obsStale`) to show a visible warning in the venue panel and area
-  panel — this was a real bug found live: DMI's forecast endpoint was
-  429-rate-limited, silently serving an **11-hour-old** cached reading
-  with no indication, so a venue's "Cloud forecast for 23:00" showed up
-  at 10am with no way to tell it wasn't current. Don't let a stale
-  response render as if it were fresh — always surface the `X-Cache`
-  header when adding a new weather/data display.
+  and the client checks that header (`forecastStale`/`obsStale`) to show a
+  visible warning in the venue panel and area panel — this was a real bug
+  found live: DMI's forecast endpoint was 429-rate-limited, silently
+  serving an **11-hour-old** cached reading with no indication, so a
+  venue's "Cloud forecast for 23:00" showed up at 10am with no way to
+  tell it wasn't current. Don't let a stale response render as if it
+  were fresh — always surface the `X-Cache` header when adding a new
+  weather/data display.
+  **`forecastStale` and `obsStale` are surfaced as two independent
+  warnings (`renderStaleNotes` in `app.js`), not one combined message.**
+  Cloud cover (`/api/forecast`) and temp/wind (`/api/weather`) are two
+  genuinely separate DMI calls that fail independently — DMI's forecast
+  endpoint rate-limits noticeably harder than the observation one, so
+  it's routine for only one of the two to be stale at a time. A user
+  explicitly asked for this after finding a single combined "DMI's data
+  is unavailable" note ambiguous — no way to tell which reading was
+  actually the cached one. Each note only renders when that specific
+  flag is true; if you add a third weather source, give it its own
+  independent stale check rather than folding it into an existing one.
+  **The venue panel shows each reading's own timestamp for the same
+  reason** — "Temp/wind observed at…" (from DMI observation's `observed`
+  property, via `fetchDmiParameter`'s `observed` field →
+  `fetchStationWeather`'s `observedTime`) sits right next to "Cloud
+  forecast for…", since a user asked for it after noticing the two
+  legitimately disagree (the station reports every 10 minutes; the
+  forecast picks the nearest hourly step) and wanted to see why rather
+  than just trust one combined-looking number. `observedTime` is kept as
+  an ISO string until render time in `openVenueDetail`, same as
+  `forecastTime` — see the "never store a Date in GeoJSON properties"
+  entry above for why that pattern exists, though `observedTime` itself
+  never touches a GeoJSON feature (it's area-wide, not per-venue), so
+  that specific bug doesn't apply to it — the ISO-string convention is
+  just kept consistent anyway.
 - **Nothing loads on page open.** The map starts idle; data only fetches
   when the user toggles an area on. Don't reintroduce an eager fetch.
 - **Areas are multi-select, not radio buttons.** Multiple can be active

@@ -549,14 +549,21 @@ async function fetchDmiParameter(stationId, parameterId) {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`DMI proxy responded ${res.status}`);
     const data = await res.json();
-    const value = data.features && data.features[0] && data.features[0].properties.value;
+    const props = data.features && data.features[0] && data.features[0].properties;
+    const value = props && props.value;
     return {
       value: typeof value === 'number' ? value : null,
+      // "observed" is when the station actually took this reading, not when
+      // we fetched it — stations report on the dot every 10 minutes, so
+      // this can trail "now" by up to ~10 minutes even on a fresh (non-stale)
+      // read. Kept as an ISO string, not a Date, for the same reason
+      // forecastTime is: reconstruct the Date only at render time.
+      observed: (props && props.observed) || null,
       stale: res.headers.get('X-Cache') === 'STALE'
     };
   } catch (err) {
     console.error(`DMI fetch failed for ${parameterId}`, err);
-    return { value: null, stale: false };
+    return { value: null, observed: null, stale: false };
   }
 }
 
@@ -601,6 +608,11 @@ async function fetchStationWeather(center) {
     temperature: temp.value,
     windSpeed: wSpeed.value,
     windDir: wDir.value,
+    // temp_dry's observed time stands in for "when this reading was taken" —
+    // the station reports all three parameters on the same 10-minute tick,
+    // so in practice all three timestamps agree; temp is just the one always
+    // fetched, so it's the representative one rather than picking arbitrarily.
+    observedTime: temp.observed,
     obsStale: temp.stale || wSpeed.stale || wDir.stale,
     station
   };
@@ -1068,6 +1080,28 @@ function formatWeatherValue(value, unit, decimals = 0) {
   return value == null ? '—' : `${value.toFixed(decimals)}${unit}`;
 }
 
+// Cloud cover and temp/wind are two genuinely separate DMI calls
+// (/api/forecast vs /api/weather — see "Cloud cover and temp/wind come
+// from two different DMI APIs" in CLAUDE.md), and they fail independently
+// of each other — DMI's forecast endpoint rate-limits noticeably harder
+// than the observation one, so it's common for only one of the two to be
+// stale at a time. A single combined "DMI's data is unavailable" note
+// used to blur that together, which was confusing — no way to tell
+// whether the cloud reading, the temp/wind reading, or both were the
+// cached one. Each gets called out separately here instead, and only
+// when it's actually stale — no news is fresh news, same as everywhere
+// else stale-cache warnings show up in this app.
+function renderStaleNotes(weather) {
+  const notes = [];
+  if (weather.forecastStale) {
+    notes.push('☁️ Cloud forecast is temporarily unavailable (DMI\'s forecast API is rate-limited right now) — showing the last cached reading.');
+  }
+  if (weather.obsStale) {
+    notes.push('🌡️ Temperature/wind reading is temporarily unavailable (DMI\'s observation API is rate-limited right now) — showing the last cached reading.');
+  }
+  return notes.map(n => `<div class="vd-stale-note">${n}</div>`).join('');
+}
+
 // --- Opening hours (best-effort OSM `opening_hours` parser) ------------
 //
 // OSM's opening_hours syntax is notoriously irregular in the wild — tested
@@ -1225,8 +1259,10 @@ function openVenueDetail(feature) {
   // Temp/wind/station stay area-wide; cloud cover/forecast time/staleness are
   // this venue's own grid-cell reading (see fetchVenueForecasts), which can
   // genuinely differ from the area's average shown in the top panel.
+  const areaWeather = areaData ? areaData.weather : {};
   const weather = {
-    ...(areaData ? areaData.weather : {}),
+    ...areaWeather,
+    observedTime: areaWeather.observedTime ? new Date(areaWeather.observedTime) : null,
     cloudCover: p.cloudCover,
     forecastTime: p.forecastTime ? new Date(p.forecastTime) : null,
     forecastStale: p.forecastStale
@@ -1278,8 +1314,9 @@ function openVenueDetail(feature) {
         </div>
       </div>
       ${weather.station ? `<div class="vd-station">Station: ${weather.station.name} (${weather.station.distanceKm.toFixed(1)} km away)</div>` : ''}
+      ${weather.observedTime ? `<div class="vd-station">Temp/wind observed at ${weather.observedTime.toLocaleTimeString('da-DK', { hour: '2-digit', minute: '2-digit' })}</div>` : ''}
       ${weather.forecastTime ? `<div class="vd-station">Cloud forecast for ${weather.forecastTime.toLocaleTimeString('da-DK', { hour: '2-digit', minute: '2-digit' })}</div>` : ''}
-      ${(weather.forecastStale || weather.obsStale) ? `<div class="vd-stale-note">⚠️ DMI's live data is temporarily unavailable (likely rate-limited) — showing the last cached reading, which may be several hours old.</div>` : ''}
+      ${renderStaleNotes(weather)}
       ${p.windSheltered ? `<div class="vd-wind-note">🛡️ A building appears to block the wind here — it may feel calmer than the reading above.</div>` : ''}
     </div>
 
@@ -1365,7 +1402,7 @@ function renderPanel() {
     return `
       <div class="panel-area">
         <p class="place">${area.label}</p>
-        <div class="meta">${sun.time.toLocaleTimeString('da-DK')} · Sun ${sun.altitudeDeg.toFixed(1)}° · Cloud ${weather.cloudCover == null ? '—' : weather.cloudCover.toFixed(0) + '%'}${weather.forecastStale ? ' ⚠️' : ''}</div>
+        <div class="meta">${sun.time.toLocaleTimeString('da-DK')} · Sun ${sun.altitudeDeg.toFixed(1)}° · Cloud forecast for area ${weather.cloudCover == null ? '—' : weather.cloudCover.toFixed(0) + '%'}${weather.forecastStale ? ' ⚠️' : ''}</div>
         <div class="status">${sunAvailable ? 'Sun is out' : (sunIsUp ? 'Too cloudy' : 'Sun is down')}${weather.forecastStale ? ' · cached data' : ''}</div>
       </div>`;
   }).join('');

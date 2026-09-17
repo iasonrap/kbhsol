@@ -467,6 +467,51 @@
     padding: 14px 12px; cursor: pointer; text-align: center; border-radius: 10px;
   }
   .nav-sheet-btn:first-of-type { border-top: none; }
+
+  /* --- Timeline (Now / +15 / +30): scrubs the rain/weather nowcast shown
+     in the area and venue panels. Bottom-center fixed overlay, same
+     placement pattern as #nav-sheet above, but a lower z-index — the nav
+     sheet and loading overlay should still win if they're ever open at
+     the same time. Only 3 real data points exist (see fetchVenuePrecipitation/
+     fetchVenueWeather), so dragging the handle always snaps to the
+     nearest one on release rather than offering continuous values. --- */
+  #timeline {
+    position: fixed; left: 50%; bottom: 56px; z-index: 9;
+    transform: translateX(-50%);
+    background: var(--panel); backdrop-filter: blur(14px); border: 1px solid var(--line);
+    border-radius: 16px; padding: 10px 22px 12px; box-shadow: 0 12px 32px rgba(0,0,0,0.4);
+    display: flex; flex-direction: column; align-items: center; gap: 6px;
+  }
+  #timeline[hidden] { display: none; }
+  #timeline-label { font-size: 12px; font-weight: 700; color: var(--ink); }
+  .timeline-track {
+    position: relative; width: 240px; height: 20px; margin: 0 9px;
+  }
+  .timeline-track::before {
+    content: ''; position: absolute; left: 0; right: 0; top: 50%; height: 3px;
+    background: var(--line); transform: translateY(-50%); border-radius: 2px;
+  }
+  .timeline-fill {
+    position: absolute; left: 0; top: 50%; height: 3px; width: 0%;
+    background: var(--accent); transform: translateY(-50%); border-radius: 2px;
+  }
+  .timeline-stop {
+    position: absolute; top: 50%; width: 11px; height: 11px; border-radius: 50%;
+    background: var(--panel-solid); border: 2px solid var(--line);
+    transform: translate(-50%, -50%); padding: 0; cursor: pointer;
+  }
+  .timeline-stop.active { border-color: var(--accent); background: var(--accent); }
+  .timeline-stop[data-offset="-15"] { left: 0%; }
+  .timeline-stop[data-offset="0"] { left: 33.333%; }
+  .timeline-stop[data-offset="15"] { left: 66.667%; }
+  .timeline-stop[data-offset="30"] { left: 100%; }
+  .timeline-handle {
+    position: absolute; top: 50%; left: 0%; width: 18px; height: 18px; border-radius: 50%;
+    background: var(--accent); border: 2px solid var(--panel-solid);
+    transform: translate(-50%, -50%); cursor: grab; touch-action: none;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.45);
+  }
+  .timeline-handle:active { cursor: grabbing; }
   .nav-sheet-btn:hover { background: var(--panel); }
   .nav-sheet-cancel { font-weight: 600; color: var(--accent-soft); margin-top: 6px; border-top: none; }
 
@@ -692,6 +737,17 @@
       <button class="nav-sheet-btn" id="nav-google-maps">🗺️ Google Maps</button>
       <button class="nav-sheet-btn" id="nav-apple-maps">🧭 Apple Maps</button>
       <button class="nav-sheet-btn nav-sheet-cancel" id="nav-sheet-cancel">Cancel</button>
+    </div>
+    <div id="timeline" hidden>
+      <div class="timeline-track">
+        <div class="timeline-fill"></div>
+        <button class="timeline-stop" data-offset="-15" aria-label="15 minutes ago"></button>
+        <button class="timeline-stop" data-offset="0" aria-label="Now"></button>
+        <button class="timeline-stop" data-offset="15" aria-label="15 minutes from now"></button>
+        <button class="timeline-stop" data-offset="30" aria-label="30 minutes from now"></button>
+        <div class="timeline-handle" tabindex="0" role="slider" aria-label="Forecast time" aria-valuemin="-15" aria-valuemax="30" aria-valuenow="0"></div>
+      </div>
+      <div id="timeline-label">Now</div>
     </div>
   </div>
   <div id="about-view" hidden>

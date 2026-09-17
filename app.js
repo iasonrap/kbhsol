@@ -541,29 +541,56 @@ function weatherGridCell(lon, lat) {
   return { key: `${snappedLat.toFixed(4)},${snappedLon.toFixed(4)}`, lat: snappedLat, lon: snappedLon };
 }
 
+// The 3-stop timeline (Now / +15 / +30) shared by both weather and radar —
+// must match server.py's RADAR_NOWCAST_OFFSETS_MINUTES so a client-picked
+// step index lines up with the same offset the server computed. There's no
+// shared config file, same as the weather grid steps below; if you change
+// one, change the other.
+// -15 is a real past radar observation (the "prev" frame server.py already
+// fetches for motion estimation — see fetchVenuePrecipitation), not a
+// nowcast like +15/+30 are. Must match server.py's RADAR_NOWCAST_OFFSETS_MINUTES.
+const TIMELINE_OFFSETS_MINUTES = [-15, 0, 15, 30];
+
 async function fetchYrWeather(cell) {
+  const emptyStep = offset => ({
+    offsetMinutes: offset, temperature: null, windSpeed: null, windDir: null,
+    cloudCover: null, symbolCode: null, time: null
+  });
   try {
     const res = await fetch(`/api/weather?lat=${cell.lat}&lon=${cell.lon}`);
     if (!res.ok) throw new Error(`Yr weather proxy responded ${res.status}`);
     const data = await res.json();
-    return {
-      temperature: typeof data.temperature === 'number' ? data.temperature : null,
-      windSpeed: typeof data.windSpeed === 'number' ? data.windSpeed : null,
-      windDir: typeof data.windDir === 'number' ? data.windDir : null,
-      cloudCover: typeof data.cloudCover === 'number' ? data.cloudCover : null,
+    const steps = (data.steps || []).map(s => ({
+      offsetMinutes: s.offsetMinutes,
+      temperature: typeof s.temperature === 'number' ? s.temperature : null,
+      windSpeed: typeof s.windSpeed === 'number' ? s.windSpeed : null,
+      windDir: typeof s.windDir === 'number' ? s.windDir : null,
+      cloudCover: typeof s.cloudCover === 'number' ? s.cloudCover : null,
       // Yr's own "how sunny does this look" classification (e.g.
       // "clearsky_day"/"partlycloudy_day"/"cloudy") — not used to drive the
       // sun/shade tiering (cloudCover does that, same proven thresholds as
       // before), but shown alongside it as a nice human-readable label MET
       // Norway's forecasters already tuned, rather than us reinventing one.
-      symbolCode: data.symbolCode || null,
-      // The timeseries entry this reading is FOR, not when we fetched it —
+      symbolCode: s.symbolCode || null,
+      // The timeseries entry this step is FOR, not when we fetched it —
       // kept as an ISO string, not a Date: GeoJSON feature properties get
       // round-tripped through MapLibre's tiling worker (addSource -> click
       // event), which silently coerces a Date into a plain string anyway
       // (a real, confirmed bug the first time this was tried) — reconstruct
       // the Date only at render time instead (see openVenueDetail).
-      time: data.time || null,
+      time: s.time || null
+    }));
+    // Guards against a stale on-disk cache file from an older version of
+    // server.py's response shape (fewer/more steps, or no `steps` array
+    // at all) — server.py now versions its cache key specifically to
+    // prevent this, but this check stays as a second line of defense:
+    // trusting a short/mismatched array here silently threw
+    // `Cannot read properties of undefined` deep inside loadArea's
+    // synchronous block (no try/catch around it), which killed the
+    // whole area load with the loading overlay stuck forever and no
+    // visible error — a real, confirmed incident, not a hypothetical.
+    return {
+      steps: steps.length === TIMELINE_OFFSETS_MINUTES.length ? steps : TIMELINE_OFFSETS_MINUTES.map(emptyStep),
       // Server fell back to a cached response older than its normal expiry
       // because the live Yr fetch failed — the data shown may be out of
       // date, surface that.
@@ -571,7 +598,7 @@ async function fetchYrWeather(cell) {
     };
   } catch (err) {
     console.error('Yr weather fetch failed', err);
-    return { temperature: null, windSpeed: null, windDir: null, cloudCover: null, symbolCode: null, time: null, stale: false };
+    return { steps: TIMELINE_OFFSETS_MINUTES.map(emptyStep), stale: false };
   }
 }
 
@@ -601,13 +628,23 @@ async function fetchVenueWeather(venues) {
   for (const f of venues.features) {
     const [lon, lat] = f.geometry.coordinates;
     const w = results.get(weatherGridCell(lon, lat).key);
-    f.properties.temperature = w.temperature;
-    f.properties.windSpeed = w.windSpeed;
-    f.properties.windDir = w.windDir;
-    f.properties.cloudCover = w.cloudCover;
-    f.properties.symbolCode = w.symbolCode;
-    f.properties.weatherTime = w.time;
+    const now = w.steps[0];
+    // Flat properties stay pinned to the CURRENT (offset 0) reading — this
+    // is what drives the venue's marker color (cloudTierState) and the
+    // wind-shelter check below in loadArea, neither of which scrub with
+    // the timeline (see openVenueDetail/renderPanel for what does).
+    f.properties.temperature = now.temperature;
+    f.properties.windSpeed = now.windSpeed;
+    f.properties.windDir = now.windDir;
+    f.properties.cloudCover = now.cloudCover;
+    f.properties.symbolCode = now.symbolCode;
+    f.properties.weatherTime = now.time;
     f.properties.weatherStale = w.stale;
+    // Full 3-step timeline, for the scrub-able venue/area panels — stored
+    // as a JSON string, not a nested array/object, for the same GeoJSON-
+    // round-tripping reason properties.weatherTime is an ISO string and
+    // not a Date (see the CLAUDE.md note on this).
+    f.properties.weatherStepsJson = JSON.stringify(w.steps);
   }
 
   return results;
@@ -628,7 +665,8 @@ async function fetchVenuePrecipitation(venues) {
     const [lon, lat] = f.geometry.coordinates;
     return [lat, lon];
   });
-  if (!points.length) return { time: null, stale: false };
+  if (!points.length) return { time: null, prevTime: null, stale: false };
+  const nowIdx = TIMELINE_OFFSETS_MINUTES.indexOf(0);
   try {
     const res = await fetch('/api/precipitation', {
       method: 'POST',
@@ -639,20 +677,31 @@ async function fetchVenuePrecipitation(venues) {
     const data = await res.json();
     const stale = res.headers.get('X-Cache') === 'STALE';
     venues.features.forEach((f, i) => {
-      const v = data.values[i];
-      f.properties.precipitation = typeof v === 'number' ? v : null;
+      // values[i] is a 4-entry array [-15, now, +15, +30] mm/h, in the
+      // same TIMELINE_OFFSETS_MINUTES order the server used
+      // (RADAR_NOWCAST_OFFSETS_MINUTES). -15 and 0 are real observations
+      // (the server's "prev"/"curr" frames read directly); +15/+30 are
+      // semi-Lagrangian nowcast estimates (see radar_value_at_offset in
+      // server.py) and only ever have as much confidence as that method
+      // affords.
+      const steps = data.values[i] || [];
+      f.properties.precipitation = typeof steps[nowIdx] === 'number' ? steps[nowIdx] : null;
       f.properties.precipitationTime = data.radarTime || null;
+      f.properties.precipitationPrevTime = data.radarPrevTime || null;
       f.properties.precipitationStale = stale;
+      f.properties.precipitationStepsJson = JSON.stringify(steps);
     });
-    return { time: data.radarTime || null, stale };
+    return { time: data.radarTime || null, prevTime: data.radarPrevTime || null, stale };
   } catch (err) {
     console.error('DMI radar fetch failed', err);
     venues.features.forEach(f => {
       f.properties.precipitation = null;
       f.properties.precipitationTime = null;
+      f.properties.precipitationPrevTime = null;
       f.properties.precipitationStale = false;
+      f.properties.precipitationStepsJson = JSON.stringify(TIMELINE_OFFSETS_MINUTES.map(() => null));
     });
-    return { time: null, stale: false };
+    return { time: null, prevTime: null, stale: false };
   }
 }
 
@@ -944,6 +993,22 @@ const popup = new maplibregl.Popup({ closeButton: false, offset: 10 });
 const loadedAreas = {}; // areaId -> { venues, counts }
 let pendingLoads = 0;
 
+// --- Timeline (Now / +15 / +30) -----------------------------------------
+//
+// Global, not per-area (confirmed with the user) — one control scrubs the
+// displayed weather/rain figures for every loaded area and the currently
+// open venue panel at once. Only the NUMBERS shown scrub; venue marker
+// colors and the sun/shade state stay pinned to "now" (computed once in
+// loadArea), same as the map's building shadows — a deliberate scope
+// decision, not a missing feature, since +15/+30 min sun position and
+// building shadows would need their own recomputation to do properly and
+// weren't asked for.
+let timelineOffsetMinutes = 0;
+
+function timelineStepIndex() {
+  return TIMELINE_OFFSETS_MINUTES.indexOf(timelineOffsetMinutes);
+}
+
 function addAreaLayers(areaId, buildings, venues) {
   if (!iconsRegistered) {
     registerVenueIcons(map);
@@ -1079,6 +1144,7 @@ const venueDetailContent = document.getElementById('venue-detail-content');
 
 document.getElementById('venue-detail-close').addEventListener('click', () => {
   venueDetail.hidden = true;
+  currentVenueFeature = null;
 });
 
 function formatWeatherValue(value, unit, decimals = 0) {
@@ -1293,29 +1359,48 @@ function renderOpeningHours(raw) {
   return `<div class="vd-hours"><div class="vd-info-row">🕒 Opening hours</div>${rows}</div>`;
 }
 
+// The currently open venue's own feature, so a timeline scrub can re-render
+// its panel with the newly-selected step without needing a fresh click —
+// cleared whenever the panel closes (see the close button's handler below).
+let currentVenueFeature = null;
+
 function openVenueDetail(feature) {
+  currentVenueFeature = feature;
   const p = feature.properties;
   const areaData = loadedAreas[p.areaId];
+  const stepIdx = timelineStepIndex();
   // Temperature, wind, and cloud cover are all this venue's own grid-cell
   // reading now (see fetchVenueWeather) — Yr bundles all three into one
   // per-cell response, unlike DMI's old split (temp/wind area-wide from a
   // single station, cloud cover per-venue from a separate forecast call).
   // Can genuinely differ from the area-wide average shown in the top panel.
+  // The timeline picks which of the 3 fetched steps (Now/+15/+30) to show
+  // — everything below is already-fetched client-side data, not a new
+  // request, so scrubbing is instant.
+  const weatherStep = (JSON.parse(p.weatherStepsJson || '[]'))[stepIdx] || {};
+  const precipStep = (JSON.parse(p.precipitationStepsJson || '[]'))[stepIdx];
   const weather = {
-    temperature: p.temperature,
-    windSpeed: p.windSpeed,
-    windDir: p.windDir,
-    cloudCover: p.cloudCover,
-    symbolCode: p.symbolCode,
-    weatherTime: p.weatherTime ? new Date(p.weatherTime) : null,
+    temperature: weatherStep.temperature,
+    windSpeed: weatherStep.windSpeed,
+    windDir: weatherStep.windDir,
+    cloudCover: weatherStep.cloudCover,
+    symbolCode: weatherStep.symbolCode,
+    weatherTime: weatherStep.time ? new Date(weatherStep.time) : null,
     weatherStale: p.weatherStale,
     // Precipitation is DMI radar, not Yr — a separate upstream with its own
     // cache/refresh cadence (15 min fixed, see server.py), so it gets its
     // own timestamp and stale flag rather than sharing weatherTime/
     // weatherStale. Same ISO-string-until-render-time convention as
     // weatherTime, for the same MapLibre GeoJSON round-tripping reason.
-    precipitation: p.precipitation,
+    // At -15/0 this is a real observation ("Radar as of…" — -15 reads the
+    // "prev" frame directly, 0 reads "curr" directly); at +15/+30 it's a
+    // semi-Lagrangian nowcast estimate, not an observation, so the render
+    // below labels it "forecast" instead — see radar_value_at_offset in
+    // server.py for what that estimate actually is (and isn't).
+    precipitation: precipStep,
+    precipitationOffsetMinutes: TIMELINE_OFFSETS_MINUTES[stepIdx],
     precipitationTime: p.precipitationTime ? new Date(p.precipitationTime) : null,
+    precipitationPrevTime: p.precipitationPrevTime ? new Date(p.precipitationPrevTime) : null,
     precipitationStale: p.precipitationStale
   };
   const areaLabel = areaData ? areaData.area.label : '';
@@ -1369,7 +1454,18 @@ function openVenueDetail(feature) {
         </div>
       </div>
       ${weather.weatherTime ? `<div class="vd-station">Weather forecast for ${weather.weatherTime.toLocaleTimeString('da-DK', { hour: '2-digit', minute: '2-digit' })}</div>` : ''}
-      ${weather.precipitationTime ? `<div class="vd-station">Radar as of ${weather.precipitationTime.toLocaleTimeString('da-DK', { hour: '2-digit', minute: '2-digit' })}</div>` : ''}
+      ${weather.precipitationTime ? `<div class="vd-station">${(() => {
+        const fmt = d => d.toLocaleTimeString('da-DK', { hour: '2-digit', minute: '2-digit' });
+        if (weather.precipitationOffsetMinutes < 0) {
+          // A real past observation — the server's "prev" radar frame,
+          // fetched fresh each cache window, not derived from an assumed
+          // offset — so this uses its own actual timestamp, not
+          // precipitationTime minus 15.
+          return weather.precipitationPrevTime ? `Radar as of ${fmt(weather.precipitationPrevTime)}` : '';
+        }
+        if (weather.precipitationOffsetMinutes === 0) return `Radar as of ${fmt(weather.precipitationTime)}`;
+        return `Rain forecast for ${fmt(new Date(weather.precipitationTime.getTime() + weather.precipitationOffsetMinutes * 60000))} (nowcast)`;
+      })()}</div>` : ''}
       ${renderStaleNotes(weather)}
       ${p.windSheltered ? `<div class="vd-wind-note">🛡️ A building appears to block the wind here — it may feel calmer than the reading above.</div>` : ''}
     </div>
@@ -1433,6 +1529,130 @@ document.getElementById('nav-apple-maps').addEventListener('click', () => {
   closeNavigateSheet();
 });
 
+// --- Timeline (Now / +15 / +30) UI ---------------------------------------
+const timelineEl = document.getElementById('timeline');
+const timelineTrackEl = document.querySelector('.timeline-track');
+const timelineFillEl = document.querySelector('.timeline-fill');
+const timelineHandleEl = document.querySelector('.timeline-handle');
+const timelineLabelEl = document.getElementById('timeline-label');
+const timelineStopEls = [...document.querySelectorAll('.timeline-stop')];
+// Fallback only, shown before any area has loaded (the timeline itself is
+// hidden then anyway — see renderPanel) — real clock times always replace
+// these once radar data is in, per an explicit design call: relative
+// labels ("-15 min"/"Now"/etc.) implied a precision relative to *your*
+// clock that the data doesn't actually have. DMI's radar composite lags
+// real time by ~8-12 minutes on its own (confirmed live — see
+// RADAR_CACHE_TTL_SECONDS in server.py), so "Now" showing a clock time
+// from several minutes ago is honest, not a bug; a generic "Now" label
+// papered over that gap in a way that read as broken instead.
+const TIMELINE_STEP_LABELS = { '-15': '-15 min', 0: 'Now', 15: '+15 min', 30: '+30 min' };
+// offset -> Date, populated from the radar response in loadArea. The
+// radar composite is one shared Denmark-wide file (not per-area), so
+// these clock times are the same regardless of which loaded area last
+// updated them — there's only ever one "current" radar frame in play.
+let timelineClockTimes = {};
+
+function timelinePercentForOffset(offset) {
+  const idx = TIMELINE_OFFSETS_MINUTES.indexOf(offset);
+  return (idx / (TIMELINE_OFFSETS_MINUTES.length - 1)) * 100;
+}
+
+function timelineClockLabel(offset) {
+  const d = timelineClockTimes[offset];
+  return d ? d.toLocaleTimeString('da-DK', { hour: '2-digit', minute: '2-digit' }) : TIMELINE_STEP_LABELS[offset];
+}
+
+// Updates the 4 steps' real clock times from the latest radar fetch —
+// radarTime/radarPrevTime are the "curr"/"prev" frames' own actual
+// observation times (see fetchVenuePrecipitation); +15/+30 are labeled
+// relative to radarTime (the nowcast's own baseline), not device time,
+// since that's what the underlying prediction is actually anchored to.
+function updateTimelineClockTimes(radarTimeIso, radarPrevTimeIso) {
+  if (!radarTimeIso) return;
+  const radarTime = new Date(radarTimeIso);
+  timelineClockTimes = {
+    '-15': radarPrevTimeIso ? new Date(radarPrevTimeIso) : null,
+    0: radarTime,
+    15: new Date(radarTime.getTime() + 15 * 60000),
+    30: new Date(radarTime.getTime() + 30 * 60000)
+  };
+  renderTimelinePosition();
+}
+
+function renderTimelinePosition() {
+  const pct = timelinePercentForOffset(timelineOffsetMinutes);
+  timelineHandleEl.style.left = `${pct}%`;
+  timelineFillEl.style.width = `${pct}%`;
+  timelineHandleEl.setAttribute('aria-valuenow', String(timelineOffsetMinutes));
+  timelineStopEls.forEach(el => {
+    const offset = Number(el.dataset.offset);
+    el.classList.toggle('active', offset === timelineOffsetMinutes);
+    el.setAttribute('aria-label', timelineClockLabel(offset));
+  });
+  timelineLabelEl.textContent = timelineClockLabel(timelineOffsetMinutes);
+}
+
+// Re-renders whatever's currently on screen for the newly-picked step —
+// all 3 steps were already fetched up front in loadArea (see
+// fetchVenueWeather/fetchVenuePrecipitation), so this never makes a new
+// network request, just picks a different already-downloaded value.
+function setTimelineOffset(minutes) {
+  if (timelineOffsetMinutes === minutes) return;
+  timelineOffsetMinutes = minutes;
+  renderTimelinePosition();
+  renderPanel();
+  if (currentVenueFeature) openVenueDetail(currentVenueFeature);
+}
+
+timelineStopEls.forEach(el => {
+  el.addEventListener('click', () => setTimelineOffset(Number(el.dataset.offset)));
+});
+
+function timelineOffsetForClientX(clientX) {
+  const rect = timelineTrackEl.getBoundingClientRect();
+  const pct = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+  const idx = Math.round(pct * (TIMELINE_OFFSETS_MINUTES.length - 1));
+  return TIMELINE_OFFSETS_MINUTES[idx];
+}
+
+// Clicking anywhere on the track (not just the 3 dots) jumps to whichever
+// stop is nearest the click — a bigger, easier target than the dots alone.
+timelineTrackEl.addEventListener('click', e => {
+  if (e.target === timelineHandleEl || e.target.classList.contains('timeline-stop')) return;
+  setTimelineOffset(timelineOffsetForClientX(e.clientX));
+});
+
+// Dragging the handle live-previews its position under the pointer, then
+// snaps to the nearest of the 3 real data points on release — there's
+// nothing to show in between, only Now/+15/+30 were ever fetched.
+let timelineDragging = false;
+timelineHandleEl.addEventListener('pointerdown', e => {
+  timelineDragging = true;
+  timelineHandleEl.setPointerCapture(e.pointerId);
+});
+timelineHandleEl.addEventListener('pointermove', e => {
+  if (!timelineDragging) return;
+  const rect = timelineTrackEl.getBoundingClientRect();
+  const pct = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width)) * 100;
+  timelineHandleEl.style.left = `${pct}%`;
+  timelineFillEl.style.width = `${pct}%`;
+});
+timelineHandleEl.addEventListener('pointerup', e => {
+  if (!timelineDragging) return;
+  timelineDragging = false;
+  setTimelineOffset(timelineOffsetForClientX(e.clientX));
+});
+timelineHandleEl.addEventListener('keydown', e => {
+  const idx = TIMELINE_OFFSETS_MINUTES.indexOf(timelineOffsetMinutes);
+  if (e.key === 'ArrowRight' && idx < TIMELINE_OFFSETS_MINUTES.length - 1) {
+    setTimelineOffset(TIMELINE_OFFSETS_MINUTES[idx + 1]);
+  } else if (e.key === 'ArrowLeft' && idx > 0) {
+    setTimelineOffset(TIMELINE_OFFSETS_MINUTES[idx - 1]);
+  }
+});
+
+renderTimelinePosition();
+
 function removeAreaLayers(areaId) {
   for (const id of [`venues-icons-${areaId}`, `venues-dots-${areaId}`, `venues-glow-${areaId}`, `buildings-3d-${areaId}`]) {
     if (map.getLayer(id)) map.removeLayer(id);
@@ -1446,13 +1666,19 @@ function renderPanel() {
   const entries = Object.values(loadedAreas);
   if (!entries.length) {
     panel.hidden = true;
+    // Nothing loaded, nothing to scrub — same visibility rule as #panel,
+    // since the timeline only ever affects data that came from loadArea.
+    timelineEl.hidden = true;
     return;
   }
   panel.hidden = false;
+  timelineEl.hidden = false;
 
+  const stepIdx = timelineStepIndex();
   const total = { sun: 0, 'partly-sunny': 0, 'building-shade': 0, 'partly-cloudy': 0, cloudy: 0, night: 0, unknown: 0 };
-  const areaRows = entries.map(({ area, sun, weather, sunAvailable, sunIsUp, counts }) => {
+  const areaRows = entries.map(({ area, sun, weatherSteps, sunAvailable, sunIsUp, counts }) => {
     for (const k in counts) total[k] += counts[k];
+    const weather = weatherSteps[stepIdx];
     return `
       <div class="panel-area">
         <p class="place">${area.label}</p>
@@ -1518,6 +1744,7 @@ async function loadArea(areaId) {
     fetchVenueWeather(venues).then(r => { markStepDone('weather'); return r; }),
     fetchVenuePrecipitation(venues).then(r => { markStepDone('radar'); return r; })
   ]);
+  updateTimelineClockTimes(radar.time, radar.prevTime);
   const sun = getSunInfo(center[1], center[0]);
 
   setLoadingText('Tracing shadows…');
@@ -1531,29 +1758,36 @@ async function loadArea(areaId) {
   // single area-wide observation station), so this average is purely for
   // the top panel's one-line area summary — a venue's own detail panel
   // always shows its own cell's un-averaged reading.
-  const cellReadings = [...weatherCells.values()];
+  const cellReadings = [...weatherCells.values()]; // each: { steps: [3 entries], stale }
   const mean = values => {
     const nums = values.filter(v => typeof v === 'number');
     return nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : null;
   };
   const weatherStale = cellReadings.some(r => r.stale);
+  const precipStepsPerVenue = venues.features.map(f => JSON.parse(f.properties.precipitationStepsJson || '[]'));
+  // One summary object per timeline step (Now/+15/+30), not just one for
+  // "now" — renderPanel picks whichever the timeline is currently on.
   // Precipitation's own mean/stale/timestamp are kept separate from
   // weather's, not folded in — it's a genuinely different upstream (DMI
   // radar vs. Yr) with its own independent cache and failure mode, the
   // same reasoning CLAUDE.md already lays out for why forecastStale and
   // obsStale used to be two flags back when temp/wind and cloud cover came
   // from two different DMI calls.
-  const precipValues = venues.features.map(f => f.properties.precipitation).filter(v => typeof v === 'number');
-  const weather = {
-    temperature: mean(cellReadings.map(r => r.temperature)),
-    windSpeed: mean(cellReadings.map(r => r.windSpeed)),
-    windDir: circularMeanDegrees(cellReadings.map(r => r.windDir).filter(v => typeof v === 'number')),
-    cloudCover: mean(cellReadings.map(r => r.cloudCover)),
-    weatherStale,
-    precipitation: precipValues.length ? mean(precipValues) : null,
-    precipitationTime: radar.time,
-    precipitationStale: radar.stale
-  };
+  const weatherSteps = TIMELINE_OFFSETS_MINUTES.map((offset, stepIdx) => {
+    const stepReadings = cellReadings.map(r => r.steps[stepIdx] || {});
+    const precipValues = precipStepsPerVenue.map(steps => steps[stepIdx]).filter(v => typeof v === 'number');
+    return {
+      offsetMinutes: offset,
+      temperature: mean(stepReadings.map(r => r.temperature)),
+      windSpeed: mean(stepReadings.map(r => r.windSpeed)),
+      windDir: circularMeanDegrees(stepReadings.map(r => r.windDir).filter(v => typeof v === 'number')),
+      cloudCover: mean(stepReadings.map(r => r.cloudCover)),
+      weatherStale,
+      precipitation: precipValues.length ? mean(precipValues) : null,
+      precipitationTime: radar.time,
+      precipitationStale: radar.stale
+    };
+  });
 
   for (const f of venues.features) {
     const cloudTier = cloudTierState(f.properties.cloudCover);
@@ -1584,7 +1818,7 @@ async function loadArea(areaId) {
   for (const f of venues.features) counts[f.properties.state]++;
   const sunAvailable = sunIsUp && (counts.sun > 0 || counts['partly-sunny'] > 0);
 
-  loadedAreas[areaId] = { area, sun, weather, sunAvailable, sunIsUp, counts };
+  loadedAreas[areaId] = { area, sun, weatherSteps, sunAvailable, sunIsUp, counts };
   renderPanel();
 
   pendingLoads--;

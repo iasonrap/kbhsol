@@ -1,0 +1,5 @@
+# Every file in this repo requires @iasonrap's approval to merge — paired
+# with "Require review from Code Owners" in main's branch protection rule,
+# this is what makes an approval from anyone else not count, even once the
+# repo is public and other people can open PRs or leave reviews.
+* @iasonrap

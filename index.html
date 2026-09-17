@@ -12,6 +12,7 @@
     --bg-deep: #060a13;
     --panel: rgba(17, 25, 43, 0.72);
     --panel-solid: #111b2c;
+    --panel-transparent: rgba(17, 25, 43, 0.32);
     --line: rgba(243, 237, 225, 0.1);
     --ink: #f3ede1;
     --ink-dim: #8d96ab;
@@ -34,6 +35,7 @@
     --bg-deep: #dfe8f0;
     --panel: rgba(255, 255, 255, 0.68);
     --panel-solid: #ffffff;
+    --panel-transparent: rgba(255, 255, 255, 0.32);
     --line: rgba(20, 40, 60, 0.12);
     --ink: #1c2b3a;
     --ink-dim: #5b6c80;
@@ -467,6 +469,63 @@
     padding: 14px 12px; cursor: pointer; text-align: center; border-radius: 10px;
   }
   .nav-sheet-btn:first-of-type { border-top: none; }
+
+  /* --- Timeline (-10 to +50 min in 5-min steps): scrubs the rain/weather
+     nowcast shown in the area and venue panels, plus a -/+ button on each
+     side to step one increment at a time. Bottom-center fixed overlay,
+     same placement pattern as #nav-sheet above, but a lower z-index — the
+     nav sheet and loading overlay should still win if they're ever open
+     at the same time. Dragging updates live on every pointermove (see
+     app.js), snapped to the nearest step, not just on release — there's
+     still only a fixed set of real data points (see
+     fetchVenuePrecipitation/fetchVenueWeather), just enough of them now
+     that continuous-looking movement during drag reads naturally. --- */
+  #timeline {
+    position: fixed; left: 50%; bottom: 56px; z-index: 9;
+    transform: translateX(-50%);
+    background: var(--panel-transparent); backdrop-filter: blur(14px); border: 1px solid var(--line);
+    border-radius: 16px; padding: 10px 16px 12px; box-shadow: 0 12px 32px rgba(0,0,0,0.4);
+    display: flex; flex-direction: column; align-items: center; gap: 6px;
+  }
+  #timeline[hidden] { display: none; }
+  #timeline-label { font-size: 12px; font-weight: 700; color: var(--ink); }
+  .timeline-row { display: flex; align-items: center; gap: 8px; }
+  .timeline-step-btn {
+    flex: 0 0 auto; width: 26px; height: 26px; border-radius: 50%; border: none;
+    background: var(--accent); color: var(--accent-ink); font-family: inherit;
+    font-size: 16px; font-weight: 700; line-height: 1; cursor: pointer;
+    display: flex; align-items: center; justify-content: center; padding: 0;
+  }
+  .timeline-step-btn:hover { background: var(--accent-soft); }
+  .timeline-step-btn:disabled { opacity: 0.4; cursor: default; }
+  .timeline-track {
+    position: relative; width: 240px; height: 20px; margin: 0 9px; cursor: pointer;
+  }
+  .timeline-track::before {
+    content: ''; position: absolute; left: 0; right: 0; top: 50%; height: 3px;
+    background: var(--line); transform: translateY(-50%); border-radius: 2px;
+  }
+  /* 13 light tick marks (one per 5-minute step, -10 to +50) — a visual
+     cue for the step count without 13 separate DOM elements, which
+     wasn't workable as individually clickable targets at this density
+     (see the JS comment by timelineTrackEl's click handler). */
+  .timeline-track::after {
+    content: ''; position: absolute; left: 0; right: 0; top: 50%; height: 5px;
+    transform: translateY(-50%);
+    background-image: repeating-linear-gradient(to right, var(--line) 0, var(--line) 1px, transparent 1px, transparent calc(100% / 12));
+    opacity: 0.7; pointer-events: none;
+  }
+  .timeline-fill {
+    position: absolute; left: 0; top: 50%; height: 3px; width: 0%;
+    background: var(--accent); transform: translateY(-50%); border-radius: 2px;
+  }
+  .timeline-handle {
+    position: absolute; top: 50%; left: 0%; width: 18px; height: 18px; border-radius: 50%;
+    background: var(--accent); border: 2px solid var(--panel-solid);
+    transform: translate(-50%, -50%); cursor: grab; touch-action: none;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.45);
+  }
+  .timeline-handle:active { cursor: grabbing; }
   .nav-sheet-btn:hover { background: var(--panel); }
   .nav-sheet-cancel { font-weight: 600; color: var(--accent-soft); margin-top: 6px; border-top: none; }
 
@@ -626,7 +685,13 @@
     #about-content h2 { font-size: 19px; margin: 30px 0 10px; }
     #about-content pre { padding: 12px; font-size: 12.5px; }
     .track-layout { padding: 20px 16px 60px; }
-  }
+
+    /* Raised higher than the desktop bottom offset — MapLibre's own
+       bottom-right attribution/info control sits at roughly the same
+       height as the desktop position, and on a narrow phone screen the
+       timeline spans close enough to that corner to visibly overlap it
+       (confirmed live via a real device screenshot, not just a resize). */
+    #timeline { bottom: 88px; }
 </style>
 </head>
 <body>
@@ -692,6 +757,17 @@
       <button class="nav-sheet-btn" id="nav-google-maps">🗺️ Google Maps</button>
       <button class="nav-sheet-btn" id="nav-apple-maps">🧭 Apple Maps</button>
       <button class="nav-sheet-btn nav-sheet-cancel" id="nav-sheet-cancel">Cancel</button>
+    </div>
+    <div id="timeline" hidden>
+      <div class="timeline-row">
+        <button id="timeline-prev" class="timeline-step-btn" type="button" aria-label="Earlier">&minus;</button>
+        <div class="timeline-track">
+          <div class="timeline-fill"></div>
+          <div class="timeline-handle" tabindex="0" role="slider" aria-label="Forecast time" aria-valuemin="-10" aria-valuemax="50" aria-valuenow="0"></div>
+        </div>
+        <button id="timeline-next" class="timeline-step-btn" type="button" aria-label="Later">+</button>
+      </div>
+      <div id="timeline-label">Now</div>
     </div>
   </div>
   <div id="about-view" hidden>

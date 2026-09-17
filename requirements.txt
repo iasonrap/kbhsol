@@ -1,6 +1,9 @@
-# This project is otherwise stdlib-only Python (see CLAUDE.md). h5py is the
-# one deliberate exception, needed only by /api/precipitation to decode
-# DMI's radar composite (ODIM_H5 format) — there's no stdlib way to read
-# HDF5. Pulls in numpy as its own transitive dependency; nothing else here
-# imports numpy directly.
+# This project is otherwise stdlib-only Python (see CLAUDE.md). h5py and
+# numpy are the deliberate exceptions, needed only by /api/precipitation:
+# h5py to decode DMI's radar composite (ODIM_H5 format, no stdlib way to
+# read HDF5), numpy for the FFT phase correlation that estimates rain
+# motion between two composites (estimate_radar_motion in server.py). numpy
+# is also h5py's own transitive dependency, but is imported directly here
+# too, so it's listed explicitly rather than relied on implicitly.
 h5py>=3.9
+numpy>=1.24

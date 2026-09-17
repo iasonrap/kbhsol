@@ -55,6 +55,25 @@ OVERPASS_CACHE_TTL_SECONDS = 25 * 24 * 60 * 60  # 25 days
 # ceiling used if that header is ever missing/unparseable, and a sane
 # default in that gap: observed live to be ~30-60 minutes in practice.
 WEATHER_CACHE_TTL_SECONDS = 60 * 60
+
+# Bumped whenever fetch_yr_weather's response JSON shape changes (folded
+# into the weather cache key below) — without this, an old cache file
+# written by a previous version of this code stays on disk and gets
+# served as-is for up to WEATHER_CACHE_TTL_SECONDS/Yr's own Expires
+# window, and the client silently gets a response shaped for an older
+# version of itself. This was a real, confirmed bug, not theoretical: the
+# response went from flat fields, to a 3-entry `steps` array, to today's
+# 4-entry one (adding the -15m timeline step) across this session without
+# this version bump, and a stale 3-entry cache file being read by the
+# 4-step-aware client threw `Cannot read properties of undefined (reading
+# 'temperature')` on `steps[3]` — which happened INSIDE loadArea's
+# synchronous block with no try/catch around it, so the whole area load
+# silently died and the loading overlay just sat there showing "Tracing
+# shadows" forever, with no visible error. Bump this any time
+# fetch_yr_weather's returned JSON shape changes, including changing
+# RADAR_NOWCAST_OFFSETS_MINUTES (which changes how many `steps` entries
+# there are).
+WEATHER_SCHEMA_VERSION = 2
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 
 OVERPASS_URLS = [
@@ -72,13 +91,21 @@ YR_URL = 'https://api.met.no/weatherapi/locationforecast/2.0/compact'
 
 # DMI's radar composite (Denmark-wide reflectivity mosaic from all of DMI's
 # radar stations) — no API key needed, confirmed live against the real
-# endpoint. Refreshes roughly every 5 minutes upstream, but we deliberately
-# cache it for a fixed 15 minutes regardless (see RADAR_CACHE_TTL_SECONDS
-# below) rather than trying to track its true cadence — polling faster just
-# to shave a few minutes off freshness isn't worth another upstream call
-# every request when rain cells move on the order of tens of minutes anyway.
+# endpoint. Refreshes roughly every 5 minutes upstream, and DMI's own
+# publish pipeline already lags real time by ~8-12 minutes on its own
+# (confirmed live: a composite timestamped 14:45 wasn't available until
+# 14:53) — that lag is a floor we can't do anything about. This TTL was
+# originally 15 minutes (deliberately not tracking the ~5-minute upstream
+# cadence, on the theory that rain moves slowly enough not to need it) but
+# that stacked ANOTHER up to 15 minutes on top of DMI's own lag, so a
+# "Now" reading could be shown up to ~25 minutes stale — confirmed live
+# and reported as feeling "super in the past" at 20 minutes. 5 minutes
+# matches DMI's actual refresh cadence: it stops us from re-fetching on
+# every single request (a burst of area loads within the same 5 minutes
+# still shares one fetch), without adding meaningfully to the lag that's
+# already baked into DMI's own pipeline.
 DMI_RADAR_ITEMS_URL = 'https://opendataapi.dmi.dk/v1/radardata/collections/composite/items'
-RADAR_CACHE_TTL_SECONDS = 15 * 60
+RADAR_CACHE_TTL_SECONDS = 5 * 60
 
 # The only files this app ever intends to serve over HTTP. Everything else in
 # the project directory (server.py, CLAUDE.md, .git/, data/, .gitignore) must
@@ -368,13 +395,22 @@ def _parse_iso(t):
 
 def fetch_yr_weather(lat, lon, retries=2):
     """Temperature, wind, and cloud cover together from MET Norway's
-    Locationforecast API (api.met.no — the data behind yr.no), read at the
-    timeseries entry nearest to now. This single call replaces both of
-    DMI's old sources (a curated observation-station list for temp/wind, a
-    separate forecast-grid call for cloud cover) — Yr's timeseries already
-    carries all three per grid cell, so there's no separate "station" concept
-    to curate any more, and temp/wind become per-venue for free instead of
-    the old area-wide single-station reading.
+    Locationforecast API (api.met.no — the data behind yr.no). This single
+    call replaces both of DMI's old sources (a curated observation-station
+    list for temp/wind, a separate forecast-grid call for cloud cover) —
+    Yr's timeseries already carries all three per grid cell, so there's no
+    separate "station" concept to curate any more, and temp/wind become
+    per-venue for free instead of the old area-wide single-station reading.
+
+    Returns a "steps" list, one entry per RADAR_NOWCAST_OFFSETS_MINUTES
+    offset (0/15/30) — same timeline the radar nowcast uses, so the client
+    can scrub one control and get both in sync. This costs nothing extra
+    upstream: Yr's response already contains a full timeseries, not just
+    one entry, so each offset just picks whichever entry in that same
+    response is nearest to now+offset, rather than issuing 3 requests.
+    Since Yr's near-term resolution is hourly, offsets that don't cross an
+    hour boundary often resolve to the identical entry — expected, not a
+    bug (there's no finer Yr data to pick between within the same hour).
 
     Returns (body_json_string, expires_unix_ts) — the caller is responsible
     for caching against that expiry (see write_cache_with_expiry), not a
@@ -416,40 +452,64 @@ def fetch_yr_weather(lat, lon, retries=2):
 
     timeseries = data['properties']['timeseries']
     now = datetime.now(timezone.utc)
-    best_entry, best_diff = timeseries[0], None
-    for entry in timeseries:
-        diff = abs((_parse_iso(entry['time']) - now).total_seconds())
-        if best_diff is None or diff < best_diff:
-            best_diff, best_entry = diff, entry
 
-    details = best_entry['data']['instant']['details']
-    # symbol_code (Yr's own human-facing "how sunny does this look" call,
-    # e.g. "clearsky_day"/"partlycloudy_day"/"cloudy") lives under whichever
-    # summary window is present — next_1_hours near "now", next_6_hours or
-    # next_12_hours further out where finer summaries aren't published.
-    symbol_code = None
-    for window in ('next_1_hours', 'next_6_hours', 'next_12_hours'):
-        summary = best_entry['data'].get(window, {}).get('summary', {})
-        if summary.get('symbol_code'):
-            symbol_code = summary['symbol_code']
-            break
+    def nearest_entry(target):
+        best_entry, best_diff = timeseries[0], None
+        for entry in timeseries:
+            diff = abs((_parse_iso(entry['time']) - target).total_seconds())
+            if best_diff is None or diff < best_diff:
+                best_diff, best_entry = diff, entry
+        return best_entry
 
-    body = json.dumps({
-        'temperature': details.get('air_temperature'),
-        'windSpeed': details.get('wind_speed'),
-        'windDir': details.get('wind_from_direction'),
-        'cloudCover': details.get('cloud_area_fraction'),
-        'symbolCode': symbol_code,
-        'time': best_entry['time']
-    })
+    steps = []
+    for offset in RADAR_NOWCAST_OFFSETS_MINUTES:
+        entry = nearest_entry(now + timedelta(minutes=offset))
+        details = entry['data']['instant']['details']
+        # symbol_code (Yr's own human-facing "how sunny does this look"
+        # call, e.g. "clearsky_day"/"partlycloudy_day"/"cloudy") lives
+        # under whichever summary window is present — next_1_hours near
+        # "now", next_6_hours or next_12_hours further out where finer
+        # summaries aren't published.
+        symbol_code = None
+        for window in ('next_1_hours', 'next_6_hours', 'next_12_hours'):
+            summary = entry['data'].get(window, {}).get('summary', {})
+            if summary.get('symbol_code'):
+                symbol_code = summary['symbol_code']
+                break
+        steps.append({
+            'offsetMinutes': offset,
+            'temperature': details.get('air_temperature'),
+            'windSpeed': details.get('wind_speed'),
+            'windDir': details.get('wind_from_direction'),
+            'cloudCover': details.get('cloud_area_fraction'),
+            'symbolCode': symbol_code,
+            'time': entry['time']
+        })
+
+    body = json.dumps({'steps': steps})
     return body, expires_ts
 
 
-def fetch_dmi_radar_composite(retries=2):
-    """Fetches the newest Denmark-wide radar composite as raw HDF5 bytes.
-    Two real HTTP calls (list the latest item, then download it), but this
-    only runs once per RADAR_CACHE_TTL_SECONDS thanks to the disk cache in
-    get_radar_composite, so it's not a cost per venue or even per request.
+def fetch_dmi_radar_pair(retries=2, target_gap_minutes=15):
+    """Fetches TWO Denmark-wide radar composites as raw HDF5 bytes: the
+    newest one available, and whichever earlier one is closest to
+    target_gap_minutes before it. The pair serves two purposes: the
+    "prev" frame is shown directly as the timeline's -15m step (a real
+    past observation, not a prediction), and the pair together is what
+    estimate_radar_motion needs to derive a motion vector for the +15/+30
+    nowcast (see that function). target_gap_minutes=15 matches the
+    timeline's -15m label (RADAR_NOWCAST_OFFSETS_MINUTES) — it won't
+    always land exactly on 15 (DMI publishes every 5 minutes, and gaps
+    can happen), but it's the closest available real frame to that mark.
+
+    One items-listing call gets both, not two — confirmed live that DMI's
+    radar composites publish every 5 minutes and a single ranged listing
+    query returns them newest-first, so asking for enough recent items in
+    one call and picking two from the list avoids a second listing round
+    trip. Only 2 download calls follow (one per chosen frame), and same as
+    fetch_yr_weather, this whole thing only runs once per
+    RADAR_CACHE_TTL_SECONDS thanks to get_radar_composite_pair's cache, so
+    it's not a cost per venue or even per request.
 
     Same small retry budget as fetch_yr_weather, for the same reason: no
     retry budget fixes a genuinely-down upstream, it only makes failures
@@ -461,9 +521,9 @@ def fetch_dmi_radar_composite(retries=2):
     # correctly returned one ~10 minutes old. An explicit range covering
     # "now" is required to actually get the latest composite, not optional.
     now = datetime.now(timezone.utc)
-    start = (now - timedelta(hours=3)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    start = (now - timedelta(minutes=40)).strftime('%Y-%m-%dT%H:%M:%SZ')
     end = now.strftime('%Y-%m-%dT%H:%M:%SZ')
-    items_url = f'{DMI_RADAR_ITEMS_URL}?limit=1&datetime={start}/{end}'
+    items_url = f'{DMI_RADAR_ITEMS_URL}?limit=8&datetime={start}/{end}'
 
     last_err = None
     for attempt in range(retries + 1):
@@ -472,44 +532,72 @@ def fetch_dmi_radar_composite(retries=2):
             with urllib.request.urlopen(list_req, timeout=15) as resp:
                 listing = json.loads(resp.read().decode('utf-8'))
             features = listing.get('features') or []
-            if not features:
-                raise RuntimeError('DMI radar item listing was empty')
-            href = features[0]['asset']['data']['href']
-            dl_req = urllib.request.Request(href, headers={'User-Agent': USER_AGENT})
-            with urllib.request.urlopen(dl_req, timeout=30) as resp:
-                return resp.read()
+            if len(features) < 2:
+                raise RuntimeError('DMI radar item listing had fewer than 2 recent items')
+
+            # Confirmed live: within a ranged query, items come back
+            # newest-first — features[0] is "now". Pick whichever other
+            # item's actual elapsed gap is closest to target_gap_minutes,
+            # rather than assuming a fixed index/cadence.
+            curr_feature = features[0]
+            curr_time = _parse_iso(curr_feature['properties']['datetime'])
+            prev_feature, best_diff = None, None
+            for f in features[1:]:
+                gap_minutes = (curr_time - _parse_iso(f['properties']['datetime'])).total_seconds() / 60
+                diff = abs(gap_minutes - target_gap_minutes)
+                if best_diff is None or diff < best_diff:
+                    best_diff, prev_feature = diff, f
+
+            def download(feature):
+                href = feature['asset']['data']['href']
+                dl_req = urllib.request.Request(href, headers={'User-Agent': USER_AGENT})
+                with urllib.request.urlopen(dl_req, timeout=30) as resp:
+                    return resp.read()
+
+            return download(curr_feature), download(prev_feature)
         except Exception as err:
-            print('DMI radar fetch attempt failed', err, flush=True)
+            print('DMI radar pair fetch attempt failed', err, flush=True)
             last_err = err
             if attempt < retries:
                 time.sleep(2 * (attempt + 1))
     raise last_err
 
 
-def get_radar_composite():
-    """Fixed 15-minute disk cache for the raw radar file, deliberately not
-    tracking the composite's own ~5-minute refresh cadence (see
-    RADAR_CACHE_TTL_SECONDS) — cache/lock/stale-fallback shape mirrors the
-    Overpass and Yr routes. Returns (cache_status, raw_bytes_or_None)."""
-    path = cache_path('radar', 'composite', ext='h5')
-    cached = read_cache_bytes(path, RADAR_CACHE_TTL_SECONDS)
-    if cached is not None:
-        return 'HIT', cached
+def get_radar_composite_pair():
+    """Fixed 5-minute disk cache for the raw "current" and "previous"
+    radar files, matching (not tracking — see RADAR_CACHE_TTL_SECONDS)
+    the composite's own refresh cadence — cache/lock/stale-fallback shape
+    mirrors the Overpass and Yr routes, just for a pair of files instead
+    of one. Returns (cache_status, curr_bytes_or_None,
+    prev_bytes_or_None)."""
+    curr_path = cache_path('radar', 'composite_curr', ext='h5')
+    prev_path = cache_path('radar', 'composite_prev', ext='h5')
+
+    def both_cached():
+        c = read_cache_bytes(curr_path, RADAR_CACHE_TTL_SECONDS)
+        p = read_cache_bytes(prev_path, RADAR_CACHE_TTL_SECONDS)
+        return (c, p) if c is not None and p is not None else (None, None)
+
+    curr, prev = both_cached()
+    if curr is not None:
+        return 'HIT', curr, prev
     with _radar_fetch_lock:
-        cached = read_cache_bytes(path, RADAR_CACHE_TTL_SECONDS)
-        if cached is not None:
-            return 'HIT', cached
+        curr, prev = both_cached()
+        if curr is not None:
+            return 'HIT', curr, prev
         try:
-            raw = fetch_dmi_radar_composite()
-            write_cache_bytes(path, raw)
-            return 'MISS', raw
+            curr, prev = fetch_dmi_radar_pair()
+            write_cache_bytes(curr_path, curr)
+            write_cache_bytes(prev_path, prev)
+            return 'MISS', curr, prev
         except Exception as err:
-            stale = read_stale_cache_bytes(path)
-            if stale is not None:
-                print('DMI radar fetch failed, serving stale cache', path, err, flush=True)
-                return 'STALE', stale
-            print('DMI radar fetch failed, no stale cache available', path, err, flush=True)
-            return 'ERROR', None
+            stale_curr = read_stale_cache_bytes(curr_path)
+            stale_prev = read_stale_cache_bytes(prev_path)
+            if stale_curr is not None and stale_prev is not None:
+                print('DMI radar fetch failed, serving stale cache', curr_path, err, flush=True)
+                return 'STALE', stale_curr, stale_prev
+            print('DMI radar fetch failed, no stale cache available', curr_path, err, flush=True)
+            return 'ERROR', None, None
 
 
 # The composite's own projection (from its HDF5 "where" group):
@@ -574,14 +662,136 @@ def decode_radar_composite(raw_bytes):
     }
 
 
-def radar_value_at(radar, lat, lon, window=1):
-    """Rain rate in mm/h at (lat, lon), via the DBZH -> Z -> R Marshall-Palmer
+# -10 to +50 in 5-minute steps, stress-testing the motion model's range —
+# only 0 is a true unprojected observation now (reads curr directly, since
+# frac=0); every other step, negative or positive, is the SAME semi-
+# Lagrangian projection from curr along the single motion vector, just
+# with a smaller/larger frac. This used to special-case negative offsets
+# to read the "prev" frame's own raw value directly (a real observation),
+# which worked when there was exactly one such step (-15) that could be
+# targeted to roughly match prev's own ~15-minute gap — it doesn't
+# generalize to multiple negative steps on a fine grid (prev is only ONE
+# frame, at ONE actual timestamp, so -10 and -5 would've shown identical
+# values reading it directly). Projecting from curr for both signs is
+# simpler and gives every step a genuinely different value. Must match
+# app.js's TIMELINE_OFFSETS_MINUTES.
+RADAR_NOWCAST_OFFSETS_MINUTES = tuple(range(-10, 51, 5))
+
+# Decoding the HDF5 pair and running the FFT motion estimate is real CPU
+# work (confirmed live: tens to hundreds of ms depending on the machine) —
+# get_radar_composite_pair's cache only avoids repeat UPSTREAM fetches, so
+# without this, every single /api/precipitation request re-decoded both
+# frames and re-ran the motion estimate from scratch even on a cache HIT,
+# including every area load in a multi-area session hitting the exact same
+# cached radar pair. Keyed by a hash of the raw curr bytes (not identity —
+# read_cache_bytes returns a fresh bytes object per call even when the
+# underlying file hasn't changed) so this only recomputes when the actual
+# radar data changes, not on every request.
+_radar_state_cache = {'key': None, 'curr': None, 'prev': None, 'dx': 0.0, 'dy': 0.0, 'dt_minutes': 0.0}
+_radar_state_lock = threading.Lock()
+
+
+def get_radar_nowcast_state():
+    """Wraps get_radar_composite_pair with an in-memory cache of the
+    already-decoded frames and estimated motion vector. Returns
+    (cache_status, curr, prev, dx, dy, dt_minutes) — curr/prev are None
+    if the upstream fetch failed with no cache to fall back to."""
+    cache_status, curr_raw, prev_raw = get_radar_composite_pair()
+    if curr_raw is None:
+        return cache_status, None, None, 0.0, 0.0, 0.0
+    key = hashlib.sha1(curr_raw).digest()
+    with _radar_state_lock:
+        if _radar_state_cache['key'] == key:
+            c = _radar_state_cache
+            return cache_status, c['curr'], c['prev'], c['dx'], c['dy'], c['dt_minutes']
+    curr = decode_radar_composite(curr_raw)
+    prev = decode_radar_composite(prev_raw)
+    dx, dy, dt_minutes = estimate_radar_motion(prev, curr)
+    with _radar_state_lock:
+        _radar_state_cache.update(key=key, curr=curr, prev=prev, dx=dx, dy=dy, dt_minutes=dt_minutes)
+    return cache_status, curr, prev, dx, dy, dt_minutes
+
+
+def estimate_radar_motion(prev, curr):
+    """Estimates a single Denmark-wide (dx, dy) pixel motion vector between
+    two decoded radar frames via FFT phase correlation, plus the actual
+    elapsed minutes between them (never assumed — see fetch_dmi_radar_pair,
+    which picks whichever real frame is closest to a 10-minute gap, not
+    necessarily exactly 10). Returns (dx, dy, dt_minutes).
+
+    This is a genuinely approximate technique — one global vector for the
+    whole scene, not per-cell motion, so it can't capture a storm growing,
+    shrinking, rotating, or splitting, only the dominant overall drift.
+    Good enough for a first version (a 15-30 minute nowcast doesn't need
+    to be exact, just directionally useful), not a claim of meteorological
+    accuracy.
+
+    Sign convention verified against a synthetic test before this was
+    wired in: given a known blob shifted by (+10, +4) pixels between two
+    synthetic frames, this returns (+10.0, +4.0) — i.e. dx/dy describe
+    motion FROM prev TO curr, in this raster's (column, row) pixel space
+    (dy > 0 means moving toward higher row numbers, which is south — see
+    decode_radar_composite/_radar_project for that convention). Getting
+    this backwards would silently predict rain moving the wrong direction
+    with no error to catch it, which is why it was checked against a
+    known-answer case first rather than trusted by inspection."""
+    import numpy as np
+
+    dt_minutes = (_parse_iso(curr['time']) - _parse_iso(prev['time'])).total_seconds() / 60
+    if dt_minutes <= 0:
+        return 0.0, 0.0, 0.0
+
+    def clean(radar):
+        v = radar['data'].astype('float32')
+        v[radar['data'] == radar['nodata']] = 0.0
+        v[radar['data'] == radar['undetect']] = 0.0
+        return v
+
+    a, b = clean(prev), clean(curr)
+    if not np.any(a) or not np.any(b):
+        # No signal to track in one of the two frames (e.g. a dry day) —
+        # nothing to correlate, so there's no motion to estimate. Falling
+        # back to (0, 0) means the nowcast degrades to persistence (the
+        # +15/+30 prediction equals the current reading), which is the
+        # correct behavior when there's no rain to have a direction at all.
+        return 0.0, 0.0, dt_minutes
+
+    # Downsampled before the FFT — motion is a large-scale, slowly-varying
+    # field, so correlating at full 500m resolution (1728x1984) buys
+    # nothing here over a coarser grid, just a much bigger transform.
+    factor = 4
+    a_small, b_small = a[::factor, ::factor], b[::factor, ::factor]
+    fa, fb = np.fft.fft2(a_small), np.fft.fft2(b_small)
+    cross = fb * np.conj(fa)
+    denom = np.abs(cross)
+    denom[denom == 0] = 1e-9
+    corr = np.abs(np.fft.fftshift(np.fft.ifft2(cross / denom)))
+    peak_row, peak_col = np.unravel_index(np.argmax(corr), corr.shape)
+    dy = (peak_row - a_small.shape[0] // 2) * factor
+    dx = (peak_col - a_small.shape[1] // 2) * factor
+    return float(dx), float(dy), dt_minutes
+
+
+def radar_value_at_offset(curr, dx, dy, dt_minutes, lat, lon, offset_minutes, window=1):
+    """Rain rate in mm/h at (lat, lon) at offset_minutes relative to curr
+    (past or future — either sign), via the DBZH -> Z -> R Marshall-Palmer
     conversion using the composite's own zr-a/zr-b constants (dataset-
-    specific, not hardcoded standard values). Averages a (2*window+1)^2
-    pixel box (default 3x3, ~1.5km at 500m/px) around the nearest pixel
-    rather than a single sample, both to smooth pixel-level noise and
-    because a venue's exact coordinate landing on a single nodata pixel
-    shouldn't blank out an otherwise-valid reading right next to it.
+    specific, not hardcoded standard values). offset_minutes=0 reads the
+    current frame at (lat, lon) directly (dx/dy have no effect). For any
+    other offset, positive or negative, this is semi-Lagrangian sampling —
+    to find what's at this fixed point at curr's time plus offset_minutes,
+    look up what's currently sitting at the position that will drift here
+    by then (upstream along the motion vector for a positive offset,
+    downstream — i.e. where it must have come FROM — for a negative one),
+    not what's currently at this exact spot. Physically this is more
+    trustworthy close to curr (small |offset_minutes|) than far from it —
+    a single global linear motion vector doesn't capture a storm turning,
+    growing, or dissipating over a longer window, and error compounds
+    with distance from the two real frames it was estimated from either
+    direction. Averages a (2*window+1)^2 pixel box (default 3x3, ~1.5km at
+    500m/px) around that sample point, both to smooth pixel-level noise
+    and because landing on a single nodata pixel shouldn't blank out an
+    otherwise-valid reading right next to it.
 
     Returns None — never 0 — when every sampled pixel is nodata (radar
     genuinely has no reading there, e.g. off the edge of coverage), the
@@ -590,23 +800,26 @@ def radar_value_at(radar, lat, lon, window=1):
     radar looked and found nothing) is a real 0.0 mm/h, not a missing
     reading, and is included in the average as such."""
     x, y = _radar_project(lat, lon)
-    col = round((x - radar['ul_x']) / radar['xscale'])
-    row = round((radar['ul_y'] - y) / radar['yscale'])
-    data = radar['data']
+    col = (x - curr['ul_x']) / curr['xscale']
+    row = (curr['ul_y'] - y) / curr['yscale']
+    frac = (offset_minutes / dt_minutes) if dt_minutes > 0 else 0.0
+    col = round(col - dx * frac)
+    row = round(row - dy * frac)
+    data = curr['data']
     h, w = data.shape
     samples = []
     for r in range(row - window, row + window + 1):
         for c in range(col - window, col + window + 1):
             if 0 <= r < h and 0 <= c < w:
                 raw = float(data[r, c])
-                if raw == radar['nodata']:
+                if raw == curr['nodata']:
                     continue
-                if raw == radar['undetect']:
+                if raw == curr['undetect']:
                     samples.append(0.0)
                     continue
-                dbz = raw * radar['gain'] + radar['offset']
+                dbz = raw * curr['gain'] + curr['offset']
                 z = 10 ** (dbz / 10)
-                samples.append((z / radar['zr_a']) ** (1 / radar['zr_b']))
+                samples.append((z / curr['zr_a']) ** (1 / curr['zr_b']))
     if not samples:
         return None
     return round(sum(samples) / len(samples), 2)
@@ -721,23 +934,35 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 validated.append((lat, lon))
 
             log_detail = {'points': len(validated)}
-            cache_status, raw_hdf5 = get_radar_composite()
-            if raw_hdf5 is None:
+            try:
+                cache_status, curr, prev, dx, dy, dt_minutes = get_radar_nowcast_state()
+            except Exception as err:
+                print('Radar decode/motion failed', err, flush=True)
+                log_api_call('radar', log_detail, 'ERROR')
+                self._send_error_json(502, 'Radar data unreadable')
+                return
+            if curr is None:
                 log_api_call('radar', log_detail, 'ERROR')
                 self._send_error_json(502, 'Upstream request failed')
                 return
 
-            try:
-                radar = decode_radar_composite(raw_hdf5)
-            except Exception as err:
-                print('Radar decode failed', err, flush=True)
-                log_api_call('radar', log_detail, 'ERROR')
-                self._send_error_json(502, 'Radar data unreadable')
-                return
-
-            values = [radar_value_at(radar, lat, lon) for lat, lon in validated]
+            # Every step (negative or positive) projects from curr along
+            # the same motion vector now — see RADAR_NOWCAST_OFFSETS_MINUTES
+            # for why the old "negative reads prev directly" special case
+            # doesn't generalize to a fine-grained grid. Only offset=0
+            # ends up a true unprojected observation (frac=0 inside
+            # radar_value_at_offset means dx/dy have no effect).
+            values = [
+                [radar_value_at_offset(curr, dx, dy, dt_minutes, lat, lon, offset)
+                 for offset in RADAR_NOWCAST_OFFSETS_MINUTES]
+                for lat, lon in validated
+            ]
             log_api_call('radar', log_detail, cache_status)
-            self._send_json(200, json.dumps({'values': values, 'radarTime': radar['time']}), cache_status)
+            self._send_json(200, json.dumps({
+                'values': values,
+                'steps': list(RADAR_NOWCAST_OFFSETS_MINUTES),
+                'radarTime': curr['time']
+            }), cache_status)
             return
 
         self.send_error(404)
@@ -771,7 +996,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
             snapped_lat, snapped_lon = snap_to_weather_grid(lat, lon)
             key = f'{snapped_lat},{snapped_lon}'
-            path = cache_path('weather', key)
+            # WEATHER_SCHEMA_VERSION is folded into the cache PATH's key
+            # (not the logged `key` above, which stays clean for the
+            # Track tab) so a schema bump can't collide with an old file
+            # written under the same lat/lon cell.
+            path = cache_path('weather', f'{key}:v{WEATHER_SCHEMA_VERSION}')
             log_detail = {'cell': key}
 
             cached = read_cache_with_expiry(path)

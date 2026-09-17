@@ -35,13 +35,12 @@ those load; nothing loads until you choose.
     shorten it themselves around a forecast model run's update. In
     practice this has been observed around 30-60 minutes; a fixed
     60-minute fallback applies only if that header is ever missing.
-  - **Radar (DMI) — a fixed 15 minutes, deliberately not tied to how
-    often DMI actually refreshes it (~5 minutes).** Unlike Yr's weather
-    cache, this isn't following an upstream freshness header — DMI's
-    radar composite doesn't send one, and rain moving over the city is
-    exactly the kind of thing that shouldn't sit behind old data, so 15
-    minutes was picked directly as a ceiling rather than derived from
-    anything DMI publishes.
+  - **Radar (DMI) — a fixed 5 minutes, matching how often DMI actually
+    refreshes it.** Unlike Yr's weather cache, this isn't following an
+    upstream freshness header — DMI's radar composite doesn't send one.
+    This used to be 15 minutes, which on top of DMI's own ~10-minute
+    publish lag could show a "Now" reading pushing 25 minutes stale —
+    tightened after that was reported as feeling "super in the past."
 - **Sun position** — computed locally with [SunCalc](https://github.com/mourner/suncalc)
   (altitude + azimuth for the current time and location). No API needed.
 - **Weather** — from [MET Norway's Locationforecast API](https://api.met.no/weatherapi/locationforecast/2.0/documentation),
@@ -81,17 +80,45 @@ those load; nothing loads until you choose.
 - **Rain** — from [DMI's radar composite](https://opendataapi.dmi.dk/v1/radardata/collections/composite/items),
   a Denmark-wide reflectivity mosaic from all of DMI's own radar stations,
   shown as mm/h at each venue's exact coordinate (not the ~2km grid cell
-  the Yr weather figures above use). One radar file covers the whole
-  country, so `server.py` fetches and decodes it once per cache window,
-  then answers every venue's rain figure from that same in-memory read —
-  no per-venue or per-cell upstream cost the way weather has. Converted
-  from the radar's raw reflectivity (dBZH) to a rain rate via the
+  the Yr weather figures above use). One radar pair (see below) covers
+  the whole country, so `server.py` fetches and decodes it once per cache
+  window, then answers every venue's rain figure from that same read — no
+  per-venue or per-cell upstream cost the way weather has. Converted from
+  the radar's raw reflectivity (dBZH) to a rain rate via the
   Marshall-Palmer Z-R relationship, using the composite's own zr-a/zr-b
   constants rather than hardcoded textbook ones. A venue right at the
   edge of radar coverage with no valid reading nearby shows no rain
   figure at all (`—`), not 0 mm/h — a genuine "radar detected nothing
   here" 0 and a missing reading are different things, and this app never
   conflates the two (same rule cloud cover already follows).
+- **A 13-step timeline, not just "right now."** A bottom-center control
+  (click anywhere on the track, or drag the handle — it snaps to the
+  nearest step) scrubs from -10 to +50 minutes in 5-minute steps, each
+  labeled with its own real clock time (not relative text like "-10 min"
+  — DMI's radar naturally lags real time by several minutes, so a
+  relative label implied a precision the data didn't have). Only the
+  exact "now" step is a real, unprojected radar observation; every other
+  step, past or future, is the same nowcast estimate, just closer to or
+  further from that one real reading (so -5 min is more trustworthy than
+  -10, the same way +5 is more trustworthy than +50 — proximity to the
+  real observation, not sign, is what matters). Getting there needs two
+  radar frames, not one: `server.py` fetches the newest composite plus
+  whichever earlier one is closest to a 15-minute gap before it, and
+  estimates a single citywide motion vector between the two (FFT phase
+  correlation on a downsampled pair of frames — one overall drift
+  direction/speed, not per-storm-cell tracking, so it can't capture a
+  cell growing, shrinking, or rotating, only its broad movement). Every
+  non-zero step then reads the *current* frame at the position that
+  motion vector says will drift into (or out of) each venue by that
+  time, rather than assuming nothing changes. If there's no rain in
+  either frame to correlate, the estimate falls back to "no motion," and
+  the whole timeline just repeats the current reading — the honest answer
+  when there's nothing to track. Yr's temperature/wind/cloud scrub on the
+  same timeline for free: its response already contains a multi-hour
+  timeseries, not just one entry, so each step just reads whichever entry
+  in that same response is nearest to now+offset — no extra request. Only
+  the numeric figures scrub, on purpose — venue marker colors and the
+  sun/shade state shown on the map stay pinned to right now.
 - **Wind shelter** — each venue is individually checked for whether a
   nearby building stands directly upwind within ~40m of its own wind
   reading — if so, its detail panel notes that the wind may feel calmer
@@ -219,11 +246,17 @@ your laptop to use the app there too, no extra setup needed.
   buildings, weather, shadows) so you can see what stage it's at.
 - The footer has a GitHub link and a "Built with Claude" note.
 - **The whole UI theme follows the actual sun** in Copenhagen: dark navy
-  (the default identity) after sunset, switching automatically to a light
-  grey/baby-blue theme — including the base map style — while the sun is
-  genuinely up. Checked once on load and every 10 minutes after (`app.js`'s
-  `computeTheme`/`switchTheme`), so a tab left open across sunrise/sunset
-  will flip on its own. The 🌙/☀️ button in the header toggles it manually
+  (the default identity) at night, switching automatically to a light
+  grey/baby-blue theme — including the base map style — while it's light
+  out. The switch happens at civil twilight (sun 6° below the horizon),
+  not exact sunrise/sunset — Copenhagen's flat, open terrain means there's
+  still real daylight for a while past geometric sunset, so using 0° made
+  the dark theme kick in noticeably before it actually looked dark. This
+  gives a buffer on both ends: day theme starts ~20-30 minutes before
+  actual sunrise and lasts ~20-30 minutes past actual sunset. Checked once
+  on load and every 10 minutes after (`app.js`'s `computeTheme`/
+  `switchTheme`), so a tab left open across sunrise/sunset will flip on
+  its own. The 🌙/☀️ button in the header toggles it manually
   at any time — doing so stops the automatic sunrise/sunset checks for the
   rest of the session, so your choice sticks. Venue marker colors (the
   sun/shade states) don't change between themes — they're semantic, not
@@ -263,10 +296,15 @@ your laptop to use the app there too, no extra setup needed.
     coordinate rather than a shared grid cell. Any of these can differ
     from the area-wide average shown in the top-left panel if the venue
     sits near the edge of its area. The panel shows exactly when each
-    reading was taken — "Weather forecast for…" for the Yr figures,
-    "Radar as of…" for rain — as two separate timestamps, since they're
-    two independent upstream sources with their own refresh cadences, not
-    one combined reading. If a building stands directly upwind of that
+    reading was taken — "Weather forecast for…" for the Yr figures, and
+    for rain either "Radar as of…" (a real observation, at the Now step)
+    or "Rain forecast for… (nowcast)" (an estimate, at +15/+30) — as two
+    separate timestamps, since they're two independent upstream sources
+    with their own refresh cadences, not one combined reading. Every
+    figure here follows the bottom-center timeline (see "A 30-minute
+    nowcast" above) — switching it instantly re-renders whichever venue
+    panel is open, no re-fetch, since all 3 steps were already downloaded
+    when the area loaded. If a building stands directly upwind of that
     specific venue's own wind reading, a note below the weather tiles
     says so — also per-venue.
   - **Venue info** — whatever OpenStreetMap has tagged for that place.

@@ -205,15 +205,16 @@ No build step, no bundler, no npm — everything loads from CDNs
   actually down, not momentarily busy. Small-and-cheap is the correct
   default; only raise it with live evidence a bigger budget actually
   recovers something, not on the assumption that it might.
-- **Rain, from DMI's radar, not Yr** (`fetch_dmi_radar_composite`,
-  `get_radar_composite`, `decode_radar_composite`, `radar_value_at`, all
-  in `server.py`; `fetchVenuePrecipitation` in `app.js`). Yr has no radar
-  product — its Locationforecast API is a point forecast, not useful for
-  "is it raining right now, exactly here." DMI operates Denmark's actual
-  radar network, so it's the only source for this, independent of the
-  forecast-endpoint reliability problem that drove this app off DMI for
-  everything else (a different DMI service — no evidence it shares that
-  history). Things that are easy to get wrong if you touch this:
+- **Rain, from DMI's radar, not Yr** (`fetch_dmi_radar_pair`,
+  `get_radar_composite_pair`, `decode_radar_composite`,
+  `radar_value_at_offset`, all in `server.py`; `fetchVenuePrecipitation`
+  in `app.js`). Yr has no radar product — its Locationforecast API is a
+  point forecast, not useful for "is it raining right now, exactly here."
+  DMI operates Denmark's actual radar network, so it's the only source
+  for this, independent of the forecast-endpoint reliability problem that
+  drove this app off DMI for everything else (a different DMI service —
+  no evidence it shares that history). Things that are easy to get wrong
+  if you touch this:
   - **DMI's radar items listing needs an explicit `datetime` range
     filter, or it does NOT return the newest composite.** Confirmed
     live: a bare `?limit=1` came back with a file from two months
@@ -223,24 +224,155 @@ No build step, no bundler, no npm — everything loads from CDNs
     header — the "old" response was a clean 200 MISS) until caught by
     actually checking the returned timestamp against the real clock, not
     by any test that only checks HTTP status. Don't drop that filter.
-  - **The composite is one file covering all of Denmark, not per-cell
-    like weather** — so `get_radar_composite` caches and locks around a
-    single fixed key (`cache_path('radar', 'composite', ext='h5')`,
-    `_radar_fetch_lock`), not a per-location key the way
-    `_weather_lock_for` works. `fetchVenuePrecipitation` sends every
-    venue's exact coordinate in one bulk POST (`/api/precipitation`)
-    rather than deduping into shared grid cells first — there's nothing
-    to dedupe against, since answering any point costs the same cheap
-    array lookup once the composite is cached, not a new upstream call.
-  - **Cached for a fixed 15 minutes (`RADAR_CACHE_TTL_SECONDS`),
-    deliberately NOT tracking the composite's own ~5-minute refresh
-    cadence.** This was an explicit choice, not an oversight — DMI's
-    radar composite sends no freshness header to follow (unlike Yr's
-    `Expires`), and rain moving over the city is exactly the data that
-    shouldn't sit behind a long cache, so 15 minutes was picked directly
-    as a reasonable ceiling rather than derived from anything DMI
-    publishes. If you ever add a header-driven cache for this like Yr's,
-    that's a deliberate change, not a bug fix.
+  - **Two composite files are fetched and cached per window, not one —
+    `curr` (newest) and `prev` (whichever earlier item is closest to a
+    10-minute gap)** — needed to derive a motion vector (see
+    `estimate_radar_motion` below), which a single frame can't give you.
+    `get_radar_composite_pair` caches and locks around two fixed keys
+    (`cache_path('radar', 'composite_curr'/'composite_prev', ext='h5')`,
+    one shared `_radar_fetch_lock`), not per-location the way
+    `_weather_lock_for` works — there's only ever one pair in play for
+    the whole city, not one per grid cell. `fetchVenuePrecipitation`
+    sends every venue's exact coordinate in one bulk POST
+    (`/api/precipitation`) rather than deduping into shared grid cells
+    first — there's nothing to dedupe against, since answering any point
+    costs the same cheap array lookup once the pair is cached and its
+    motion estimated, not a new upstream call.
+  - **The timeline is `RADAR_NOWCAST_OFFSETS_MINUTES` in `server.py` /
+    `TIMELINE_OFFSETS_MINUTES` in `app.js` — keep them in sync, no shared
+    config file, same as the weather grid steps. Currently -10 to +50 in
+    5-minute steps (13 total), stress-testing the motion model's range on
+    request.** Only offset 0 is a true unprojected observation (reads
+    curr directly, frac=0) — every other step, negative or positive,
+    goes through `radar_value_at_offset`'s SAME semi-Lagrangian
+    projection from curr along the single motion vector. This is a
+    deliberate change from an earlier version where negative offsets
+    read the "prev" frame's own raw value directly as a real
+    observation — that only worked with exactly one negative step (-15)
+    that happened to be targeted to roughly match prev's actual ~15-
+    minute gap; it doesn't generalize to multiple negative steps on a
+    fine grid, since prev is only ONE frame at ONE actual timestamp (-10
+    and -5 would've shown identical values reading it directly). If you
+    ever reduce the step count back down to something coarse, don't
+    reflexively bring the "negative reads prev directly" special case
+    back without checking whether it still makes sense at that grid
+    density. `fetch_dmi_radar_pair`'s `target_gap_minutes` (15) no longer
+    needs to line up with any specific displayed step — it now only
+    affects motion-estimate quality (too short a gap: noisy velocity from
+    500m pixel quantization; too long: assumes linear motion over a
+    longer window, risking more error for fast-changing storms).
+  - **`get_radar_nowcast_state()` caches the DECODED frames and motion
+    vector in memory, not just the raw bytes** — without it, every single
+    `/api/precipitation` request re-decoded both HDF5 files and re-ran
+    the FFT motion estimate from scratch, even on a cache HIT, which was
+    real, confirmed, avoidable repeated CPU work (a warm request dropped
+    from ~55ms to ~12ms once this was added) — reported live as "tracing
+    shadows now takes forever" (the loading step that runs right after
+    this fetch, so it read as the slow part even though the actual delay
+    was upstream of it). Keyed by a hash of the raw curr bytes, not
+    identity — `read_cache_bytes` returns a fresh `bytes` object per call
+    even when the underlying file hasn't changed, so `is`/`id()` would
+    never hit. If you touch this path, don't decode/re-estimate motion
+    directly in the route handler again — always go through this
+    function so a cache HIT stays cheap.
+    `estimate_radar_motion(prev, curr)` derives ONE Denmark-wide (dx, dy)
+    pixel drift vector via FFT phase correlation on downsampled
+    (factor-4) frames — a genuinely approximate technique (one global
+    vector, not per-cell motion, so it can't capture a storm growing,
+    shrinking, rotating, or splitting), confirmed as a reasonable first
+    version, not meteorological-grade, per an explicit conversation about
+    the tradeoff before this was built. **The sign convention was
+    verified against a synthetic test before being wired in, not trusted
+    by inspection** — a shifted synthetic blob confirmed `cross = fb *
+    conj(fa)` (not `fa * conj(fb)`, which is backwards) gives the correct
+    prev→curr motion direction; getting this backwards would have
+    silently predicted rain moving the wrong way with no error to catch
+    it. `radar_value_at_offset` does semi-Lagrangian sampling for any
+    non-zero offset (past or future) — to predict what's at a fixed
+    point at curr's time plus that offset, it reads the CURRENT frame at
+    the position upstream (or downstream, for a negative offset) along
+    the motion vector, not the current frame at that same fixed point.
+    This is more trustworthy close to offset 0 than far from it — a
+    single global linear vector can't capture a storm turning, growing,
+    or dissipating over a longer window, so error compounds with
+    distance from curr in either direction; there's no per-step
+    confidence indicator for this in the UI currently, just the general
+    understanding that steps far from 0 are less reliable. If either
+    frame has no rain signal at all (`np.any(a)`/`np.any(b)` both false),
+    motion falls back to `(0, 0)` — the whole timeline then degrades to
+    persistence (every step equals the current reading), which is the
+    *correct* behavior for "nothing to track," not a bug. The client
+    (`fetchVenuePrecipitation` in `app.js`) fetches all steps in one POST
+    per area load, not one request per step — `timelineStepIndex()`/
+    `setTimelineOffset()` switch which already-downloaded step is
+    displayed instantly, no re-fetch on scrub. **Yr's temp/wind/cloud get
+    the same multi-step treatment for free** (`fetch_yr_weather` returns
+    a `steps` array, one entry per offset, each just the nearest
+    timeseries entry to now+offset from the SAME single Yr response — no
+    extra upstream cost, since Yr's timeseries already covers many hours,
+    we're just reading N different points in one response instead of 1).
+    Since Yr's near-term resolution is hourly, steps that don't cross an
+    hour boundary often resolve to the identical entry — expected, not a
+    bug.
+  - **The timeline UI has no individual per-step dot buttons any more —
+    just a draggable handle on a track with light tick marks (CSS
+    `repeating-linear-gradient` on `.timeline-track::after`), not 13 DOM
+    elements.** This is a deliberate change from the original 4-step
+    design, which rendered one `<button class="timeline-stop">` per
+    offset with a hardcoded `left` percentage per `data-offset` value in
+    CSS — that doesn't scale past a handful of steps (13 individually
+    clickable dots on a ~280px track would be unusably small targets, and
+    hardcoding 13 CSS position rules is exactly the kind of thing that
+    breaks the next time the step count changes). Clicking anywhere on
+    the track or dragging the handle both route through the same
+    `timelineOffsetForClientX`, which computes the nearest step generically
+    from `TIMELINE_OFFSETS_MINUTES.length` — this already scales to any
+    step count, so if the range/granularity changes again, only
+    `TIMELINE_OFFSETS_MINUTES` (`app.js`) and `RADAR_NOWCAST_OFFSETS_MINUTES`
+    (`server.py`) need to change, nothing in the click/drag handling.
+  - **Only the numeric figures scrub with the timeline — venue marker
+    colors, sun/shade state, and building shadows stay pinned to "now."**
+    A deliberate scope decision (confirmed with the user before building
+    this), not a missing feature: recomputing sun position/shadows for
+    +15/+30 would be a separate, real feature. If you ever add that,
+    don't assume the existing per-venue `state`/`cloudTierState` call
+    sites should just start reading a step-indexed value — check whether
+    marker recoloring was actually asked for first.
+  - **The timeline's stop labels show real clock times (`17:30`,
+    `17:45`, …), not relative text (`-15 min`, `Now`) — a deliberate
+    fix, not the original design.** The original relative labels implied
+    a precision the data doesn't have: DMI's radar composite lags real
+    time by ~8-12 minutes on its own (see `RADAR_CACHE_TTL_SECONDS`
+    above), so "Now" was showing a reading up to that far behind the
+    viewer's actual clock, and "-15 min" was picked from whatever frame
+    was actually available (DMI publishes every 5 minutes), so it wasn't
+    reliably exactly -15 either — reported live as confusing/looking
+    broken when a venue's "Now" step showed 17:35 while the user had
+    clicked at 17:47. `updateTimelineClockTimes` (`app.js`) computes all
+    4 steps' real times from the radar response alone (`radarTime`/
+    `radarPrevTime`, both already real observation timestamps) — it does
+    NOT use the device's own clock, so the timeline is internally
+    consistent with itself and with the per-venue "Radar as of…"/"…
+    (nowcast)" labels, even though neither is a promise about your
+    actual wall clock. If you ever want to anchor +15/+30 to the
+    viewer's device time instead of the radar frame's own time, that's a
+    deliberate design change (discussed and explicitly deferred — the
+    relative-label version silently baked in this same assumption
+    without saying so, which is what caused the confusion), not a bug
+    fix — don't do it without re-confirming that's actually wanted.
+  - **Cached for a fixed 5 minutes (`RADAR_CACHE_TTL_SECONDS`), matching
+    (not tracking via a header — DMI sends none, unlike Yr's `Expires`)
+    the composite's own ~5-minute refresh cadence.** This was 15 minutes
+    originally, on the theory that rain moves slowly enough not to need
+    tighter caching — wrong in practice: DMI's own publish pipeline
+    already lags real time by ~8-12 minutes on its own (confirmed live: a
+    14:45 composite wasn't available until 14:53), and stacking up to 15
+    more minutes of our own cache on top of that meant a "Now" reading
+    could be shown up to ~25 minutes stale — confirmed live and reported
+    as feeling "super in the past" at a 20-minute gap. 5 minutes still
+    dedupes a burst of area loads within the same window, without adding
+    meaningfully to the lag DMI's pipeline already has. Don't raise this
+    back toward 15 without re-checking that math.
   - **The reflectivity-to-rain-rate conversion (dBZH → Z → mm/h) uses the
     composite's own `zr-a`/`zr-b` constants from its `how` HDF5 group**,
     not hardcoded Marshall-Palmer textbook values — confirmed live these
@@ -251,8 +383,8 @@ No build step, no bundler, no npm — everything loads from CDNs
     different things (no radar coverage there vs. radar looked and found
     nothing), the same "don't invent a value for a missing reading" rule
     `cloudTierState(null)` already follows for cloud cover. If every
-    sampled pixel around a point is `nodata`, `radar_value_at` returns
-    `None`, not `0` — the venue then shows `—` for rain, not "no rain."
+    sampled pixel around a point is `nodata`, `radar_value_at_offset`
+    returns `None`, not `0` — the venue then shows `—` for rain, not "no rain."
   - **The composite's stereographic projection (`_radar_project` in
     server.py) is a spherical approximation, not full WGS84-ellipsoidal**
     — confirmed against the file's own corner coordinates to be accurate
@@ -276,10 +408,21 @@ No build step, no bundler, no npm — everything loads from CDNs
     non-abusive area load: Indre By alone has 700+ venues in one POST
     body. If you add a new area with even more venues, re-check this
     isn't the bottleneck before assuming something else broke.
-- **The UI theme (dark by default, light "day" theme while the sun's up in
-  Copenhagen) is driven by `computeTheme()`/`switchTheme()` in `app.js`,
-  toggling `document.documentElement.dataset.theme` and swapping the
-  MapLibre style between `MAP_STYLES.night`/`.day`.** `map.setStyle()`
+- **The UI theme (dark by default, light "day" theme while it's actually
+  light out in Copenhagen) is driven by `computeTheme()`/`switchTheme()`
+  in `app.js`, toggling `document.documentElement.dataset.theme` and
+  swapping the MapLibre style between `MAP_STYLES.night`/`.day`.**
+  **`computeTheme()`'s threshold is civil twilight (sun 6° below the
+  horizon, `CIVIL_TWILIGHT_ALTITUDE_RAD`), not geometric sunrise/sunset
+  (0°)** — this was 0° originally, but Copenhagen's flat terrain and open
+  horizon mean there's real ambient daylight for a while after the sun's
+  actual altitude crosses 0°, so the dark theme was kicking in while it
+  visibly still looked light outside (a real, reported complaint, not a
+  theoretical one). One threshold gives a buffer on both ends for free:
+  day theme now starts ~20-30 minutes before actual sunrise and lasts
+  ~20-30 minutes past actual sunset (varies by season/day length) — don't
+  special-case morning vs. evening separately, the single comparison in
+  `computeTheme()` already covers both. `map.setStyle()`
   wipes all custom sources/layers, so every active area gets relayered
   from `areaDataCache` (raw buildings/venues GeoJSON kept in memory per
   loaded area) afterward — don't add a new per-area MapLibre layer

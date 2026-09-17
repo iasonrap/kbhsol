@@ -280,6 +280,15 @@ function renderTrackView(entries) {
     groupKey: e => e.cell || 'unknown',
     groupLabel: g => g
   });
+  // Radar has no per-cell concept like weather does (one composite covers
+  // all of Denmark, see fetchVenuePrecipitation) — grouped by cache status
+  // instead, which is the more useful dimension here anyway: how often a
+  // 15-minute-cached radar fetch was a HIT vs. a real upstream MISS/STALE.
+  renderTrackChart('chart-radar', 'legend-radar', entries, buckets, bucketMs, {
+    filterKind: 'radar',
+    groupKey: e => e.cache || 'unknown',
+    groupLabel: g => g
+  });
 
   renderTrackLogTable(entries);
 }
@@ -389,7 +398,7 @@ function renderTrackLogTable(entries) {
     return;
   }
 
-  const KIND_LABELS = { overpass: 'Overpass', weather: 'Weather' };
+  const KIND_LABELS = { overpass: 'Overpass', weather: 'Weather', radar: 'Radar' };
   tbody.innerHTML = recent.map(e => {
     const time = new Date(e.ts).toLocaleString('da-DK', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
     let detail = '';
@@ -398,6 +407,8 @@ function renderTrackLogTable(entries) {
       detail = `${escapeHtml(label)} · ${escapeHtml(e.requestKind || '')}`;
     } else if (e.kind === 'weather') {
       detail = `tile ${escapeHtml(e.cell || '—')}`;
+    } else if (e.kind === 'radar') {
+      detail = `${escapeHtml(String(e.points ?? '—'))} points`;
     }
     const cache = escapeHtml(e.cache || '');
     return `<tr>
@@ -600,6 +611,49 @@ async function fetchVenueWeather(venues) {
   }
 
   return results;
+}
+
+// --- DMI radar (precipitation) ------------------------------------------
+//
+// A different shape from fetchVenueWeather above: there's only one radar
+// composite covering all of Denmark at a time (server.py caches it once,
+// not per grid cell), so this sends every venue's own exact coordinate in
+// a single bulk POST rather than snapping to a shared grid first — the
+// per-point cost on the server is just an array lookup against whichever
+// composite is already cached, not a new upstream request per point, so
+// there's nothing to gain from deduping venues into cells the way weather
+// does.
+async function fetchVenuePrecipitation(venues) {
+  const points = venues.features.map(f => {
+    const [lon, lat] = f.geometry.coordinates;
+    return [lat, lon];
+  });
+  if (!points.length) return { time: null, stale: false };
+  try {
+    const res = await fetch('/api/precipitation', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(points)
+    });
+    if (!res.ok) throw new Error(`DMI radar proxy responded ${res.status}`);
+    const data = await res.json();
+    const stale = res.headers.get('X-Cache') === 'STALE';
+    venues.features.forEach((f, i) => {
+      const v = data.values[i];
+      f.properties.precipitation = typeof v === 'number' ? v : null;
+      f.properties.precipitationTime = data.radarTime || null;
+      f.properties.precipitationStale = stale;
+    });
+    return { time: data.radarTime || null, stale };
+  } catch (err) {
+    console.error('DMI radar fetch failed', err);
+    venues.features.forEach(f => {
+      f.properties.precipitation = null;
+      f.properties.precipitationTime = null;
+      f.properties.precipitationStale = false;
+    });
+    return { time: null, stale: false };
+  }
 }
 
 // Circular mean, not a plain arithmetic average — wind direction wraps at
@@ -840,6 +894,7 @@ function resetLoadingSteps() {
       <span data-step="venues"></span>
       <span data-step="buildings"></span>
       <span data-step="weather"></span>
+      <span data-step="radar"></span>
       <span data-step="shadows"></span>
     </div>
   `;
@@ -1069,11 +1124,22 @@ function formatSymbolCode(code) {
 // fetchVenueWeather) — DMI used to split these across two APIs that failed
 // independently, which is why this used to show two separate stale notes.
 // One combined source now means one flag/note is the correct, simpler
-// behavior, not a regression — no news is fresh news, same as everywhere
-// else stale-cache warnings show up in this app.
+// behavior for THIS source, not a regression — no news is fresh news, same
+// as everywhere else stale-cache warnings show up in this app.
+// Precipitation (DMI radar) is a separate upstream with its own cache and
+// failure mode, so it gets its own independent note rather than being
+// folded into weatherStale — exactly the same reasoning that used to give
+// forecastStale/obsStale two notes back when DMI split cloud cover and
+// temp/wind across two calls.
 function renderStaleNotes(weather) {
-  if (!weather.weatherStale) return '';
-  return '<div class="vd-stale-note">🌦️ Weather data is temporarily unavailable right now — showing the last cached reading.</div>';
+  let html = '';
+  if (weather.weatherStale) {
+    html += '<div class="vd-stale-note">🌦️ Weather data is temporarily unavailable right now — showing the last cached reading.</div>';
+  }
+  if (weather.precipitationStale) {
+    html += '<div class="vd-stale-note">📡 Radar data is temporarily unavailable right now — showing the last cached reading.</div>';
+  }
+  return html;
 }
 
 // --- Opening hours (best-effort OSM `opening_hours` parser) ------------
@@ -1242,7 +1308,15 @@ function openVenueDetail(feature) {
     cloudCover: p.cloudCover,
     symbolCode: p.symbolCode,
     weatherTime: p.weatherTime ? new Date(p.weatherTime) : null,
-    weatherStale: p.weatherStale
+    weatherStale: p.weatherStale,
+    // Precipitation is DMI radar, not Yr — a separate upstream with its own
+    // cache/refresh cadence (15 min fixed, see server.py), so it gets its
+    // own timestamp and stale flag rather than sharing weatherTime/
+    // weatherStale. Same ISO-string-until-render-time convention as
+    // weatherTime, for the same MapLibre GeoJSON round-tripping reason.
+    precipitation: p.precipitation,
+    precipitationTime: p.precipitationTime ? new Date(p.precipitationTime) : null,
+    precipitationStale: p.precipitationStale
   };
   const areaLabel = areaData ? areaData.area.label : '';
   const stateColor = STATE_COLORS[p.state] || '#4a5568';
@@ -1289,8 +1363,13 @@ function openVenueDetail(feature) {
           <div class="val">${formatWeatherValue(weather.cloudCover, '%')}</div>
           <div class="label">Cloud</div>
         </div>
+        <div class="vd-weather-item">
+          <div class="val">${formatWeatherValue(weather.precipitation, ' mm/h', 1)}</div>
+          <div class="label">Rain</div>
+        </div>
       </div>
       ${weather.weatherTime ? `<div class="vd-station">Weather forecast for ${weather.weatherTime.toLocaleTimeString('da-DK', { hour: '2-digit', minute: '2-digit' })}</div>` : ''}
+      ${weather.precipitationTime ? `<div class="vd-station">Radar as of ${weather.precipitationTime.toLocaleTimeString('da-DK', { hour: '2-digit', minute: '2-digit' })}</div>` : ''}
       ${renderStaleNotes(weather)}
       ${p.windSheltered ? `<div class="vd-wind-note">🛡️ A building appears to block the wind here — it may feel calmer than the reading above.</div>` : ''}
     </div>
@@ -1377,8 +1456,8 @@ function renderPanel() {
     return `
       <div class="panel-area">
         <p class="place">${area.label}</p>
-        <div class="meta">${sun.time.toLocaleTimeString('da-DK')} · Sun ${sun.altitudeDeg.toFixed(1)}° · Cloud forecast for area ${weather.cloudCover == null ? '—' : weather.cloudCover.toFixed(0) + '%'}${weather.weatherStale ? ' ⚠️' : ''}</div>
-        <div class="status">${sunAvailable ? 'Sun is out' : (sunIsUp ? 'Too cloudy' : 'Sun is down')}${weather.weatherStale ? ' · cached data' : ''}</div>
+        <div class="meta">${sun.time.toLocaleTimeString('da-DK')} · Sun ${sun.altitudeDeg.toFixed(1)}° · Cloud forecast for area ${weather.cloudCover == null ? '—' : weather.cloudCover.toFixed(0) + '%'}${weather.weatherStale ? ' ⚠️' : ''} · Rain ${weather.precipitation == null ? '—' : weather.precipitation.toFixed(1) + ' mm/h'}${weather.precipitationStale ? ' ⚠️' : ''}</div>
+        <div class="status">${sunAvailable ? 'Sun is out' : (sunIsUp ? 'Too cloudy' : 'Sun is down')}${weather.weatherStale || weather.precipitationStale ? ' · cached data' : ''}</div>
       </div>`;
   }).join('');
 
@@ -1435,8 +1514,10 @@ async function loadArea(areaId) {
   }
 
   setLoadingText('Checking the sky over Copenhagen…');
-  const weatherCells = await fetchVenueWeather(venues);
-  markStepDone('weather');
+  const [weatherCells, radar] = await Promise.all([
+    fetchVenueWeather(venues).then(r => { markStepDone('weather'); return r; }),
+    fetchVenuePrecipitation(venues).then(r => { markStepDone('radar'); return r; })
+  ]);
   const sun = getSunInfo(center[1], center[0]);
 
   setLoadingText('Tracing shadows…');
@@ -1456,12 +1537,22 @@ async function loadArea(areaId) {
     return nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : null;
   };
   const weatherStale = cellReadings.some(r => r.stale);
+  // Precipitation's own mean/stale/timestamp are kept separate from
+  // weather's, not folded in — it's a genuinely different upstream (DMI
+  // radar vs. Yr) with its own independent cache and failure mode, the
+  // same reasoning CLAUDE.md already lays out for why forecastStale and
+  // obsStale used to be two flags back when temp/wind and cloud cover came
+  // from two different DMI calls.
+  const precipValues = venues.features.map(f => f.properties.precipitation).filter(v => typeof v === 'number');
   const weather = {
     temperature: mean(cellReadings.map(r => r.temperature)),
     windSpeed: mean(cellReadings.map(r => r.windSpeed)),
     windDir: circularMeanDegrees(cellReadings.map(r => r.windDir).filter(v => typeof v === 'number')),
     cloudCover: mean(cellReadings.map(r => r.cloudCover)),
-    weatherStale
+    weatherStale,
+    precipitation: precipValues.length ? mean(precipValues) : null,
+    precipitationTime: radar.time,
+    precipitationStale: radar.stale
   };
 
   for (const f of venues.features) {

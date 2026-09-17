@@ -300,7 +300,7 @@
 
 
   #loading-overlay {
-    position: absolute; inset: 0; z-index: 5;
+    position: absolute; inset: 0; z-index: 12;
     display: flex; flex-direction: column; align-items: center; justify-content: center;
     gap: 20px; background: radial-gradient(circle at 50% 40%, #1c2740, var(--bg-deep) 70%);
     transition: opacity 0.5s ease;
@@ -678,6 +678,7 @@
         <span data-step="venues"></span>
         <span data-step="buildings"></span>
         <span data-step="weather"></span>
+        <span data-step="radar"></span>
         <span data-step="shadows"></span>
       </div>
     </div>
@@ -703,7 +704,7 @@
     <div class="track-layout">
       <div class="track-header">
         <h2>API traffic</h2>
-        <p>Every request this server makes to Overpass and Yr (MET Norway), and how often the local cache saved one — so it's visible if something starts spamming the upstream APIs.</p>
+        <p>Every request this server makes to Overpass, Yr (MET Norway), and DMI's radar, and how often the local cache saved one — so it's visible if something starts spamming the upstream APIs.</p>
         <div class="track-controls">
           <div class="track-gran">
             <button class="track-gran-btn active" data-granularity="hour">Hourly · 24h</button>
@@ -725,6 +726,11 @@
           <h3>Weather — per grid tile</h3>
           <div class="track-chart" id="chart-forecast"></div>
           <div class="track-legend" id="legend-forecast"></div>
+        </section>
+        <section class="track-card">
+          <h3>Radar — per area load</h3>
+          <div class="track-chart" id="chart-radar"></div>
+          <div class="track-legend" id="legend-radar"></div>
         </section>
       </div>
 

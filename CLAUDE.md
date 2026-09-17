@@ -6,18 +6,23 @@ Guidance for Claude Code when working in this repository.
 
 A static web app (`index.html` + `app.js`) that shows which cafés/bars/
 restaurants in selected Copenhagen areas are currently in sun or shade,
-combining live cloud cover from Yr (MET Norway), computed sun position,
-and OSM building shadow geometry. Full details of the current
-implementation live in `readme.md` — read it first, and keep it in sync
-with any change you make (the app's own About tab renders it live, so
-it's user-facing, not just internal docs).
+combining live cloud cover from Yr (MET Norway), rain from DMI's radar,
+computed sun position, and OSM building shadow geometry. Full details of
+the current implementation live in `readme.md` — read it first, and keep
+it in sync with any change you make (the app's own About tab renders it
+live, so it's user-facing, not just internal docs).
 
-**This is the `api-yr` branch.** The original weather source was DMI;
-it was replaced here after a sustained real outage (DMI's forecast
-endpoint 429-ing/timing out for an evening, confirmed not fixable by a
-bigger retry budget) with MET Norway's Locationforecast API (the data
-behind yr.no) — see the "Why Yr, not DMI" bullet further down and
-readme.md's section of the same name for the full story.
+The original weather source was DMI; it was replaced with MET Norway's
+Locationforecast API (the data behind yr.no) after a sustained real outage
+(DMI's forecast endpoint 429-ing/timing out for an evening, confirmed not
+fixable by a bigger retry budget) — see the "Why Yr, not DMI" bullet
+further down and readme.md's section of the same name for the full story.
+
+**This is the `precipitation` branch.** It adds rain (mm/h) per venue,
+sourced from DMI's radar composite, not from Yr — Yr has no radar
+product. This is a third upstream and the one dependency this project has
+beyond Python's standard library (`h5py`, to decode the radar's raw HDF5
+format) — see the "Rain, from DMI's radar" bullet further down.
 
 ## Running it
 
@@ -25,10 +30,12 @@ readme.md's section of the same name for the full story.
 python3 server.py
 ```
 
-Never use plain `python3 -m http.server` — `server.py` is a stdlib-only
-Python server that both serves the static files *and* proxies/caches
-Overpass + Yr requests to disk under `data/`. Skipping it means every
-click hits the public APIs directly.
+Never use plain `python3 -m http.server` — `server.py` serves the static
+files *and* proxies/caches Overpass + Yr + DMI radar requests to disk
+under `data/`. Skipping it means every click hits the public APIs
+directly. `server.py` itself is otherwise stdlib-only Python; the one
+exception is `h5py` (`pip3 install -r requirements.txt`), needed only to
+decode DMI's radar composite — see the "Rain, from DMI's radar" bullet.
 
 To restart during development:
 
@@ -40,14 +47,16 @@ python3 server.py > /tmp/proxy_server.log 2>&1 &
 ## Architecture
 
 - `index.html` — structure + all CSS (no separate stylesheet).
-- `app.js` — everything: area config, Overpass/Yr fetch wrappers, sun/shadow
-  math, MapLibre rendering, the tabs/About-page/TOC logic, the Track tab's
-  charts and log table.
+- `app.js` — everything: area config, Overpass/Yr/radar fetch wrappers,
+  sun/shadow math, MapLibre rendering, the tabs/About-page/TOC logic, the
+  Track tab's charts and log table.
 - `server.py` — static file server + caching proxy. No other backend.
-- `data/` — cache files (gitignored), named `<prefix>_<sha1-of-request>.json`,
-  plus `data/api_log.jsonl` — one line per proxied API call (see "Track tab"
-  below).
+- `data/` — cache files (gitignored), named `<prefix>_<sha1-of-request>.json`
+  (or `.h5` for the cached radar composite), plus `data/api_log.jsonl` —
+  one line per proxied API call (see "Track tab" below).
 - `readme.md` — user-facing docs, also rendered live inside the app's About tab.
+- `requirements.txt` — the one dependency this project has, `h5py`, needed
+  only for decoding DMI's radar composite.
 
 No build step, no bundler, no npm — everything loads from CDNs
 (MapLibre GL, Turf.js, SunCalc, marked.js) directly in `index.html`.
@@ -196,6 +205,77 @@ No build step, no bundler, no npm — everything loads from CDNs
   actually down, not momentarily busy. Small-and-cheap is the correct
   default; only raise it with live evidence a bigger budget actually
   recovers something, not on the assumption that it might.
+- **Rain, from DMI's radar, not Yr** (`fetch_dmi_radar_composite`,
+  `get_radar_composite`, `decode_radar_composite`, `radar_value_at`, all
+  in `server.py`; `fetchVenuePrecipitation` in `app.js`). Yr has no radar
+  product — its Locationforecast API is a point forecast, not useful for
+  "is it raining right now, exactly here." DMI operates Denmark's actual
+  radar network, so it's the only source for this, independent of the
+  forecast-endpoint reliability problem that drove this app off DMI for
+  everything else (a different DMI service — no evidence it shares that
+  history). Things that are easy to get wrong if you touch this:
+  - **DMI's radar items listing needs an explicit `datetime` range
+    filter, or it does NOT return the newest composite.** Confirmed
+    live: a bare `?limit=1` came back with a file from two months
+    earlier, while the same call with `&datetime=<3h-ago>/<now>` at the
+    same moment correctly returned one ~10 minutes old. This silently
+    served stale-looking-fresh radar data (no error, no STALE cache
+    header — the "old" response was a clean 200 MISS) until caught by
+    actually checking the returned timestamp against the real clock, not
+    by any test that only checks HTTP status. Don't drop that filter.
+  - **The composite is one file covering all of Denmark, not per-cell
+    like weather** — so `get_radar_composite` caches and locks around a
+    single fixed key (`cache_path('radar', 'composite', ext='h5')`,
+    `_radar_fetch_lock`), not a per-location key the way
+    `_weather_lock_for` works. `fetchVenuePrecipitation` sends every
+    venue's exact coordinate in one bulk POST (`/api/precipitation`)
+    rather than deduping into shared grid cells first — there's nothing
+    to dedupe against, since answering any point costs the same cheap
+    array lookup once the composite is cached, not a new upstream call.
+  - **Cached for a fixed 15 minutes (`RADAR_CACHE_TTL_SECONDS`),
+    deliberately NOT tracking the composite's own ~5-minute refresh
+    cadence.** This was an explicit choice, not an oversight — DMI's
+    radar composite sends no freshness header to follow (unlike Yr's
+    `Expires`), and rain moving over the city is exactly the data that
+    shouldn't sit behind a long cache, so 15 minutes was picked directly
+    as a reasonable ceiling rather than derived from anything DMI
+    publishes. If you ever add a header-driven cache for this like Yr's,
+    that's a deliberate change, not a bug fix.
+  - **The reflectivity-to-rain-rate conversion (dBZH → Z → mm/h) uses the
+    composite's own `zr-a`/`zr-b` constants from its `how` HDF5 group**,
+    not hardcoded Marshall-Palmer textbook values — confirmed live these
+    are present in every composite file DMI publishes, so there's no
+    reason to hardcode a possibly-stale assumption instead.
+  - **A pixel that's `nodata` is excluded from the average; a pixel
+    that's `undetect` is included as a real 0.0 mm/h** — these are
+    different things (no radar coverage there vs. radar looked and found
+    nothing), the same "don't invent a value for a missing reading" rule
+    `cloudTierState(null)` already follows for cloud cover. If every
+    sampled pixel around a point is `nodata`, `radar_value_at` returns
+    `None`, not `0` — the venue then shows `—` for rain, not "no rain."
+  - **The composite's stereographic projection (`_radar_project` in
+    server.py) is a spherical approximation, not full WGS84-ellipsoidal**
+    — confirmed against the file's own corner coordinates to be accurate
+    to within ~0.4% across the whole Denmark-to-Sweden extent (987.7km
+    computed vs. 992km actual grid width), comfortably inside the margin
+    needed to land in the right ~500m pixel for one city. This also
+    relies on the composite's `lat_ts` equaling its `lat_0` (56°, both),
+    which is what makes the scale factor `k0` come out to exactly `1` —
+    don't reuse that shortcut for a different projection where those two
+    values differ.
+  - **`precipitationStale`/`precipitationTime` are kept independent of
+    `weatherStale`/`weatherTime`, not folded together** — same reasoning
+    CLAUDE.md already documents for why `forecastStale`/`obsStale` used
+    to be two flags back when DMI split cloud cover and temp/wind across
+    two calls: Yr and DMI radar are two genuinely separate upstreams that
+    fail independently, so `renderStaleNotes` in `app.js` shows up to two
+    notes, and the venue panel shows two separate "as of" timestamps
+    ("Weather forecast for…" / "Radar as of…").
+  - **`MAX_PRECIPITATION_POINTS` is 1000, not something smaller** —
+    confirmed live that a lower cap (500) silently 400'd a real,
+    non-abusive area load: Indre By alone has 700+ venues in one POST
+    body. If you add a new area with even more venues, re-check this
+    isn't the bottleneck before assuming something else broke.
 - **The UI theme (dark by default, light "day" theme while the sun's up in
   Copenhagen) is driven by `computeTheme()`/`switchTheme()` in `app.js`,
   toggling `document.documentElement.dataset.theme` and swapping the
@@ -248,15 +328,18 @@ No build step, no bundler, no npm — everything loads from CDNs
   Don't bind to `localhost` again without re-adding an explicit opt-in
   for LAN access, and don't add a new `/api/*` route without the same
   hardening pattern: per-IP rate limiting (`api_rate_limited()`/
-  `static_rate_limited()`), a body-size cap on `/api/overpass`, and
-  bounds-checked `lat`/`lon` in `/api/weather`.
+  `static_rate_limited()`), a body-size cap (`/api/overpass`,
+  `/api/precipitation`) plus a point-count cap on the latter
+  (`MAX_PRECIPITATION_POINTS`, since 1000 tiny points can still fit under
+  a byte cap sized for a few hundred), and bounds-checked `lat`/`lon` in
+  `/api/weather` and `/api/precipitation`.
 - **Static file serving is an allowlist (`PUBLIC_PATHS`), not a
   blocklist — do not change this back.** This was a real, confirmed,
   serious vulnerability, not a theoretical one: before this fix,
   `server.py` served the *entire* project directory via
   `SimpleHTTPRequestHandler`'s default behavior, meaning
   `GET /data/` returned a live directory listing of every cached
-  Overpass/Yr response plus the full, unbounded `api_log.jsonl` (bypassing
+  Overpass/Yr/radar response plus the full, unbounded `api_log.jsonl` (bypassing
   `/api/logs`' own size cap entirely), `GET /server.py` returned the
   complete backend source, and `GET /.git/config` / `.git/HEAD` /
   `.git/logs/HEAD` all returned 200 — the whole git history was
@@ -270,8 +353,8 @@ No build step, no bundler, no npm — everything loads from CDNs
   reopens the `data/`-style listing risk for whatever else ends up in
   that directory later).
 - **Rate limiting is two separate budgets, not one shared one, and both
-  are 120/min** — `api_rate_limited` protects the Overpass/Yr proxies
-  specifically; `static_rate_limited` protects the server itself (static
+  are 120/min** — `api_rate_limited` protects the Overpass/Yr/DMI-radar
+  proxies specifically; `static_rate_limited` protects the server itself (static
   files and `/api/logs`, neither of which costs an upstream call). They
   used to be one shared 30/min bucket covering everything, which broke
   real usage: a single area load fans out into an Overpass call plus
@@ -299,19 +382,21 @@ No build step, no bundler, no npm — everything loads from CDNs
 
 - **The "Track" tab (third header tab, alongside Map/About) visualizes every
   proxied API call** — Overpass venues/buildings per area, Yr weather per
-  grid tile — as hourly/daily stacked-bar charts plus a raw log table, so
-  cache effectiveness (or accidental API spamming) is visible rather than
-  only inferable from server console output. Only two chart cards now, not
-  three — DMI's old split between a forecast-per-tile call and an
-  observation-per-station call collapsed into one Yr call per grid cell
-  when this branch replaced it, so there's one weather chart instead of
-  two; don't re-add a third card without a real second weather-call kind
-  to justify it. `server.py`'s `log_api_call()` appends one JSON line per
+  grid tile, DMI radar per area load — as hourly/daily stacked-bar charts
+  plus a raw log table, so cache effectiveness (or accidental API
+  spamming) is visible rather than only inferable from server console
+  output. Three chart cards, not two — the radar card groups by cache
+  status (`HIT`/`MISS`/`STALE`) rather than by tile/cell the way the
+  weather card does, since one radar composite covers the whole city
+  rather than being split per grid cell; don't force it into the same
+  per-cell grouping the other two charts use, there's no cell dimension
+  to group by. `server.py`'s `log_api_call()` appends one JSON line per
   request (cache status included — `HIT`/`MISS`/`STALE`/`ERROR`) to
-  `data/api_log.jsonl` at every response branch of `/api/overpass` and
-  `/api/weather` — **if you add a new branch to either route (a new error
-  path, a new cache outcome), log it too, or that branch becomes
-  invisible to the Track tab.** The log is trimmed to the last
+  `data/api_log.jsonl` at every response branch of `/api/overpass`,
+  `/api/weather`, and `/api/precipitation` — **if you add a new branch to
+  any of those routes (a new error path, a new cache outcome), log it
+  too, or that branch becomes invisible to the Track tab.** The log is
+  trimmed to the last
   `LOG_TRIM_KEEP_LINES` (10,000) once it exceeds `MAX_LOG_BYTES` (5MB), so it
   won't grow unbounded on a long-running server. `GET /api/logs` serves the
   raw entries (capped, rate-limited like the other routes) to

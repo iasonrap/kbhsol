@@ -8,18 +8,29 @@ changes rarely, so it's cached for weeks; weather is cached for whatever Yr's
 own Expires header says. This means clicking areas on and off re-uses cached
 data instead of re-hitting the public APIs every time.
 
-DMI was this app's weather source until this branch (`api-yr`) — dropped
-after DMI's forecast endpoint spent an evening either 429-ing or timing out
+DMI was this app's weather source until the `api-yr` branch — dropped after
+DMI's forecast endpoint spent an evening either 429-ing or timing out
 outright, sustained enough that no retry budget fixed it (see git history on
 `solskin` for that investigation). MET Norway's locationforecast API
 (api.met.no, the data behind yr.no) replaces both of DMI's old sources
 (observation stations + forecast grid) with ONE per-cell call that returns
 temp/wind/cloud together — no more curated station list, and temp/wind
 become per-venue instead of per-area as a side effect, not extra work.
+
+This branch (`precipitation`) adds a THIRD upstream: DMI's radar composite,
+back for radar only, not for temp/wind/cloud — Yr has no radar product, and
+DMI, which runs Denmark's actual radar network, is simply the only source
+for this regardless of the forecast-endpoint history above (a different
+DMI service, no evidence it shares that reliability problem). Requires
+h5py (see requirements.txt) to decode its raw HDF5 composite — the one
+exception to this project's stdlib-only rule, since there's no stdlib way
+to read HDF5.
 """
 import hashlib
 import http.server
+import io
 import json
+import math
 import os
 import re
 import socket
@@ -28,7 +39,7 @@ import time
 import urllib.request
 import urllib.error
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse, parse_qs, quote
 
@@ -59,6 +70,16 @@ OVERPASS_URLS = [
 # per their ToS (snap_to_weather_grid already does more rounding than that).
 YR_URL = 'https://api.met.no/weatherapi/locationforecast/2.0/compact'
 
+# DMI's radar composite (Denmark-wide reflectivity mosaic from all of DMI's
+# radar stations) — no API key needed, confirmed live against the real
+# endpoint. Refreshes roughly every 5 minutes upstream, but we deliberately
+# cache it for a fixed 15 minutes regardless (see RADAR_CACHE_TTL_SECONDS
+# below) rather than trying to track its true cadence — polling faster just
+# to shave a few minutes off freshness isn't worth another upstream call
+# every request when rain cells move on the order of tens of minutes anyway.
+DMI_RADAR_ITEMS_URL = 'https://opendataapi.dmi.dk/v1/radardata/collections/composite/items'
+RADAR_CACHE_TTL_SECONDS = 15 * 60
+
 # The only files this app ever intends to serve over HTTP. Everything else in
 # the project directory (server.py, CLAUDE.md, .git/, data/, .gitignore) must
 # stay unreachable — see the do_GET allowlist check for why this is an
@@ -74,6 +95,9 @@ PUBLIC_PATHS = {'/', '/index.html', '/app.js', '/readme.md'}
 # by arbitrary input. None of this matters for local personal use, but it
 # does the moment this is reachable from the internet.
 MAX_OVERPASS_BODY_BYTES = 20_000  # our real queries are a few hundred bytes
+MAX_PRECIPITATION_BODY_BYTES = 30_000  # a full area's worth of [lat,lon] pairs is ~20KB at most
+MAX_PRECIPITATION_POINTS = 1000        # Indre By alone has 700+ venues — confirmed live that
+                                        # a lower cap here silently 400'd a real, non-abusive load
 RATE_LIMIT_WINDOW_SECONDS = 60
 
 
@@ -146,6 +170,14 @@ def _weather_lock_for(key):
         return _weather_fetch_locks[key]
 
 
+# Unlike weather, there's only ever one radar composite in play at a time
+# (it covers all of Denmark in one file, not per-cell) — a single shared
+# lock is enough to coalesce a whole area's worth of concurrent requests
+# into one upstream DMI fetch, the same purpose _weather_lock_for serves
+# per-cell.
+_radar_fetch_lock = threading.Lock()
+
+
 def valid_latlon(value, lo, hi):
     try:
         f = float(value)
@@ -214,9 +246,9 @@ def log_field(value):
     return value if value and _LOG_FIELD_RE.match(value) else ''
 
 
-def cache_path(prefix, key):
+def cache_path(prefix, key, ext='json'):
     digest = hashlib.sha1(key.encode('utf-8')).hexdigest()
-    return os.path.join(DATA_DIR, f'{prefix}_{digest}.json')
+    return os.path.join(DATA_DIR, f'{prefix}_{digest}.{ext}')
 
 
 def read_cache(path, ttl_seconds):
@@ -263,6 +295,39 @@ def write_cache(path, body):
 # logic with two different meanings at once).
 def write_cache_with_expiry(path, body, expires_ts):
     write_cache(path, json.dumps({'expires': expires_ts, 'body': body}))
+
+
+# Binary variants of read_cache/write_cache/read_stale_cache, used only for
+# the raw DMI radar HDF5 file — it's a binary blob, not JSON text, so the
+# text-mode helpers above can't be reused for it as-is.
+def read_cache_bytes(path, ttl_seconds):
+    if not os.path.exists(path):
+        return None
+    if time.time() - os.path.getmtime(path) > ttl_seconds:
+        return None
+    try:
+        with open(path, 'rb') as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def read_stale_cache_bytes(path):
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'rb') as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def write_cache_bytes(path, data):
+    try:
+        with open(path, 'wb') as f:
+            f.write(data)
+    except OSError as err:
+        print('Warning: failed to write cache file', path, err)
 
 
 def read_cache_with_expiry(path, allow_stale=False):
@@ -380,6 +445,173 @@ def fetch_yr_weather(lat, lon, retries=2):
     return body, expires_ts
 
 
+def fetch_dmi_radar_composite(retries=2):
+    """Fetches the newest Denmark-wide radar composite as raw HDF5 bytes.
+    Two real HTTP calls (list the latest item, then download it), but this
+    only runs once per RADAR_CACHE_TTL_SECONDS thanks to the disk cache in
+    get_radar_composite, so it's not a cost per venue or even per request.
+
+    Same small retry budget as fetch_yr_weather, for the same reason: no
+    retry budget fixes a genuinely-down upstream, it only makes failures
+    take longer (confirmed the hard way with DMI's old forecast endpoint —
+    see that function's docstring)."""
+    # A bare `?limit=1` with no datetime filter does NOT return the newest
+    # item — confirmed live: it came back with a composite from two months
+    # earlier while an explicit datetime-range query at the same moment
+    # correctly returned one ~10 minutes old. An explicit range covering
+    # "now" is required to actually get the latest composite, not optional.
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(hours=3)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    end = now.strftime('%Y-%m-%dT%H:%M:%SZ')
+    items_url = f'{DMI_RADAR_ITEMS_URL}?limit=1&datetime={start}/{end}'
+
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            list_req = urllib.request.Request(items_url, headers={'User-Agent': USER_AGENT})
+            with urllib.request.urlopen(list_req, timeout=15) as resp:
+                listing = json.loads(resp.read().decode('utf-8'))
+            features = listing.get('features') or []
+            if not features:
+                raise RuntimeError('DMI radar item listing was empty')
+            href = features[0]['asset']['data']['href']
+            dl_req = urllib.request.Request(href, headers={'User-Agent': USER_AGENT})
+            with urllib.request.urlopen(dl_req, timeout=30) as resp:
+                return resp.read()
+        except Exception as err:
+            print('DMI radar fetch attempt failed', err, flush=True)
+            last_err = err
+            if attempt < retries:
+                time.sleep(2 * (attempt + 1))
+    raise last_err
+
+
+def get_radar_composite():
+    """Fixed 15-minute disk cache for the raw radar file, deliberately not
+    tracking the composite's own ~5-minute refresh cadence (see
+    RADAR_CACHE_TTL_SECONDS) — cache/lock/stale-fallback shape mirrors the
+    Overpass and Yr routes. Returns (cache_status, raw_bytes_or_None)."""
+    path = cache_path('radar', 'composite', ext='h5')
+    cached = read_cache_bytes(path, RADAR_CACHE_TTL_SECONDS)
+    if cached is not None:
+        return 'HIT', cached
+    with _radar_fetch_lock:
+        cached = read_cache_bytes(path, RADAR_CACHE_TTL_SECONDS)
+        if cached is not None:
+            return 'HIT', cached
+        try:
+            raw = fetch_dmi_radar_composite()
+            write_cache_bytes(path, raw)
+            return 'MISS', raw
+        except Exception as err:
+            stale = read_stale_cache_bytes(path)
+            if stale is not None:
+                print('DMI radar fetch failed, serving stale cache', path, err, flush=True)
+                return 'STALE', stale
+            print('DMI radar fetch failed, no stale cache available', path, err, flush=True)
+            return 'ERROR', None
+
+
+# The composite's own projection (from its HDF5 "where" group):
+#   +proj=stere +ellps=WGS84 +lat_0=56 +lon_0=10.5666 +lat_ts=56
+# A spherical (not full WGS84-ellipsoidal) stereographic forward projection
+# is used here rather than pulling in pyproj — confirmed against the file's
+# own corner coordinates that this is accurate to within ~0.4% over the
+# whole Denmark-to-Sweden extent (987.7km computed vs. 992km actual grid
+# width), which is comfortably inside the margin needed to land in the
+# right ~500m pixel for a single city. lat_ts equals lat_0 here, which is
+# what makes k0 (the scale factor at the projection center) come out to
+# exactly 1 — this only holds because DMI's composite happens to define it
+# that way; don't reuse this shortcut for a projection where lat_ts != lat_0.
+_RADAR_LAT0 = math.radians(56.0)
+_RADAR_LON0 = math.radians(10.5666)
+_RADAR_EARTH_RADIUS_M = 6371000.0
+
+
+def _radar_project(lat_deg, lon_deg):
+    lat = math.radians(lat_deg)
+    lon = math.radians(lon_deg)
+    k = 2 * _RADAR_EARTH_RADIUS_M / (
+        1 + math.sin(_RADAR_LAT0) * math.sin(lat)
+        + math.cos(_RADAR_LAT0) * math.cos(lat) * math.cos(lon - _RADAR_LON0))
+    x = k * math.cos(lat) * math.sin(lon - _RADAR_LON0)
+    y = k * (math.cos(_RADAR_LAT0) * math.sin(lat)
+             - math.sin(_RADAR_LAT0) * math.cos(lat) * math.cos(lon - _RADAR_LON0))
+    return x, y
+
+
+def decode_radar_composite(raw_bytes):
+    """Parses the ODIM_H5 composite into the pieces radar_value_at needs.
+    h5py (and its transitive numpy dependency) is the one exception to this
+    project's stdlib-only rule — there's no stdlib way to read HDF5, and
+    decoding this ourselves byte-by-byte isn't worth it. Imported lazily so
+    a missing h5py only breaks this one route, not the whole server."""
+    try:
+        import h5py
+    except ImportError as err:
+        raise RuntimeError(
+            "h5py isn't installed — run `pip3 install h5py` (see requirements.txt)") from err
+
+    with h5py.File(io.BytesIO(raw_bytes), 'r') as f:
+        data = f['dataset1/data1/data'][()]
+        what = f['what'].attrs
+        where = f['where'].attrs
+        how = f['how'].attrs
+        date_str = what['date'].decode() if isinstance(what['date'], bytes) else str(what['date'])
+        time_str = what['time'].decode() if isinstance(what['time'], bytes) else str(what['time'])
+        ul_lat, ul_lon = float(where['UL_lat'][0]), float(where['UL_lon'][0])
+        gain, offset = float(what['gain']), float(what['offset'])
+        nodata, undetect = float(what['nodata']), float(what['undetect'])
+        zr_a, zr_b = float(how['zr-a'][0]), float(how['zr-b'][0])
+        xscale, yscale = float(where['xscale']), float(where['yscale'])
+
+    ul_x, ul_y = _radar_project(ul_lat, ul_lon)
+    time_iso = f'{date_str[0:4]}-{date_str[4:6]}-{date_str[6:8]}T{time_str[0:2]}:{time_str[2:4]}:{time_str[4:6]}Z'
+    return {
+        'data': data, 'ul_x': ul_x, 'ul_y': ul_y, 'xscale': xscale, 'yscale': yscale,
+        'gain': gain, 'offset': offset, 'nodata': nodata, 'undetect': undetect,
+        'zr_a': zr_a, 'zr_b': zr_b, 'time': time_iso,
+    }
+
+
+def radar_value_at(radar, lat, lon, window=1):
+    """Rain rate in mm/h at (lat, lon), via the DBZH -> Z -> R Marshall-Palmer
+    conversion using the composite's own zr-a/zr-b constants (dataset-
+    specific, not hardcoded standard values). Averages a (2*window+1)^2
+    pixel box (default 3x3, ~1.5km at 500m/px) around the nearest pixel
+    rather than a single sample, both to smooth pixel-level noise and
+    because a venue's exact coordinate landing on a single nodata pixel
+    shouldn't blank out an otherwise-valid reading right next to it.
+
+    Returns None — never 0 — when every sampled pixel is nodata (radar
+    genuinely has no reading there, e.g. off the edge of coverage), the
+    same "don't invent a value for a missing reading" rule the rest of
+    this app follows for cloud cover. A pixel that IS 'undetect' (the
+    radar looked and found nothing) is a real 0.0 mm/h, not a missing
+    reading, and is included in the average as such."""
+    x, y = _radar_project(lat, lon)
+    col = round((x - radar['ul_x']) / radar['xscale'])
+    row = round((radar['ul_y'] - y) / radar['yscale'])
+    data = radar['data']
+    h, w = data.shape
+    samples = []
+    for r in range(row - window, row + window + 1):
+        for c in range(col - window, col + window + 1):
+            if 0 <= r < h and 0 <= c < w:
+                raw = float(data[r, c])
+                if raw == radar['nodata']:
+                    continue
+                if raw == radar['undetect']:
+                    samples.append(0.0)
+                    continue
+                dbz = raw * radar['gain'] + radar['offset']
+                z = 10 ** (dbz / 10)
+                samples.append((z / radar['zr_a']) ** (1 / radar['zr_b']))
+    if not samples:
+        return None
+    return round(sum(samples) / len(samples), 2)
+
+
 class Handler(http.server.SimpleHTTPRequestHandler):
     def end_headers(self):
         # This is a local dev tool under active development — never let the
@@ -450,6 +682,62 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     print('Overpass fetch failed, no stale cache available', path, err, flush=True)
                     log_api_call('overpass', log_detail, 'ERROR')
                     self._send_error_json(502, 'Upstream request failed')
+            return
+
+        if self.path.startswith('/api/precipitation'):
+            if api_rate_limited(self._client_ip()):
+                self._send_error_json(429, 'Too many requests')
+                return
+
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+            except ValueError:
+                length = -1
+            if length < 0 or length > MAX_PRECIPITATION_BODY_BYTES:
+                self._send_error_json(413, 'Request body too large')
+                self.close_connection = True
+                return
+
+            raw_body = self.rfile.read(length)
+            try:
+                points = json.loads(raw_body.decode('utf-8'))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_error_json(400, 'Invalid JSON body')
+                return
+            if not isinstance(points, list) or len(points) > MAX_PRECIPITATION_POINTS:
+                self._send_error_json(400, 'Invalid points list')
+                return
+
+            validated = []
+            for p in points:
+                if not (isinstance(p, list) and len(p) == 2):
+                    self._send_error_json(400, 'Invalid point')
+                    return
+                lat = valid_latlon(p[0], 54, 58)
+                lon = valid_latlon(p[1], 7, 16)
+                if lat is None or lon is None:
+                    self._send_error_json(400, 'Invalid lat/lon in points')
+                    return
+                validated.append((lat, lon))
+
+            log_detail = {'points': len(validated)}
+            cache_status, raw_hdf5 = get_radar_composite()
+            if raw_hdf5 is None:
+                log_api_call('radar', log_detail, 'ERROR')
+                self._send_error_json(502, 'Upstream request failed')
+                return
+
+            try:
+                radar = decode_radar_composite(raw_hdf5)
+            except Exception as err:
+                print('Radar decode failed', err, flush=True)
+                log_api_call('radar', log_detail, 'ERROR')
+                self._send_error_json(502, 'Radar data unreadable')
+                return
+
+            values = [radar_value_at(radar, lat, lon) for lat, lon in validated]
+            log_api_call('radar', log_detail, cache_status)
+            self._send_json(200, json.dumps({'values': values, 'radarTime': radar['time']}), cache_status)
             return
 
         self.send_error(404)

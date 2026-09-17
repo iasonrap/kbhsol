@@ -662,11 +662,20 @@ def decode_radar_composite(raw_bytes):
     }
 
 
-# -15 is a real past observation (the "prev" radar frame — see
-# fetch_dmi_radar_pair/get_radar_composite_pair — already fetched for
-# motion estimation, so showing it costs nothing extra), not a nowcast
-# like +15/+30 are. Must match app.js's TIMELINE_OFFSETS_MINUTES.
-RADAR_NOWCAST_OFFSETS_MINUTES = (-15, 0, 15, 30)
+# -10 to +50 in 5-minute steps, stress-testing the motion model's range —
+# only 0 is a true unprojected observation now (reads curr directly, since
+# frac=0); every other step, negative or positive, is the SAME semi-
+# Lagrangian projection from curr along the single motion vector, just
+# with a smaller/larger frac. This used to special-case negative offsets
+# to read the "prev" frame's own raw value directly (a real observation),
+# which worked when there was exactly one such step (-15) that could be
+# targeted to roughly match prev's own ~15-minute gap — it doesn't
+# generalize to multiple negative steps on a fine grid (prev is only ONE
+# frame, at ONE actual timestamp, so -10 and -5 would've shown identical
+# values reading it directly). Projecting from curr for both signs is
+# simpler and gives every step a genuinely different value. Must match
+# app.js's TIMELINE_OFFSETS_MINUTES.
+RADAR_NOWCAST_OFFSETS_MINUTES = tuple(range(-10, 51, 5))
 
 # Decoding the HDF5 pair and running the FFT motion estimate is real CPU
 # work (confirmed live: tens to hundreds of ms depending on the machine) —
@@ -764,16 +773,22 @@ def estimate_radar_motion(prev, curr):
 
 
 def radar_value_at_offset(curr, dx, dy, dt_minutes, lat, lon, offset_minutes, window=1):
-    """Rain rate in mm/h at (lat, lon) at offset_minutes into the future,
-    via the DBZH -> Z -> R Marshall-Palmer conversion using the composite's
-    own zr-a/zr-b constants (dataset-specific, not hardcoded standard
-    values). offset_minutes=0 reads the current frame at (lat, lon)
-    directly (dx/dy have no effect, same as the original radar_value_at).
-    For a positive offset, this is semi-Lagrangian backward sampling — to
-    predict what will be AT this fixed point in the future, look up what's
-    currently sitting at the position that will drift here by then (i.e.
-    upstream along the motion vector), not what's currently at this exact
-    spot. Averages a (2*window+1)^2 pixel box (default 3x3, ~1.5km at
+    """Rain rate in mm/h at (lat, lon) at offset_minutes relative to curr
+    (past or future — either sign), via the DBZH -> Z -> R Marshall-Palmer
+    conversion using the composite's own zr-a/zr-b constants (dataset-
+    specific, not hardcoded standard values). offset_minutes=0 reads the
+    current frame at (lat, lon) directly (dx/dy have no effect). For any
+    other offset, positive or negative, this is semi-Lagrangian sampling —
+    to find what's at this fixed point at curr's time plus offset_minutes,
+    look up what's currently sitting at the position that will drift here
+    by then (upstream along the motion vector for a positive offset,
+    downstream — i.e. where it must have come FROM — for a negative one),
+    not what's currently at this exact spot. Physically this is more
+    trustworthy close to curr (small |offset_minutes|) than far from it —
+    a single global linear motion vector doesn't capture a storm turning,
+    growing, or dissipating over a longer window, and error compounds
+    with distance from the two real frames it was estimated from either
+    direction. Averages a (2*window+1)^2 pixel box (default 3x3, ~1.5km at
     500m/px) around that sample point, both to smooth pixel-level noise
     and because landing on a single nodata pixel shouldn't blank out an
     otherwise-valid reading right next to it.
@@ -931,26 +946,22 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 self._send_error_json(502, 'Upstream request failed')
                 return
 
-            # A negative offset (-15m) reads the "prev" frame directly at
-            # its own real observation (offset 0 into THAT frame) — it's
-            # what actually happened, not a prediction, so it deliberately
-            # skips the motion projection that offset >= 0 uses against
-            # curr. See RADAR_NOWCAST_OFFSETS_MINUTES.
-            def value_for(lat, lon, offset):
-                if offset < 0:
-                    return radar_value_at_offset(prev, 0.0, 0.0, 1.0, lat, lon, 0)
-                return radar_value_at_offset(curr, dx, dy, dt_minutes, lat, lon, offset)
-
+            # Every step (negative or positive) projects from curr along
+            # the same motion vector now — see RADAR_NOWCAST_OFFSETS_MINUTES
+            # for why the old "negative reads prev directly" special case
+            # doesn't generalize to a fine-grained grid. Only offset=0
+            # ends up a true unprojected observation (frac=0 inside
+            # radar_value_at_offset means dx/dy have no effect).
             values = [
-                [value_for(lat, lon, offset) for offset in RADAR_NOWCAST_OFFSETS_MINUTES]
+                [radar_value_at_offset(curr, dx, dy, dt_minutes, lat, lon, offset)
+                 for offset in RADAR_NOWCAST_OFFSETS_MINUTES]
                 for lat, lon in validated
             ]
             log_api_call('radar', log_detail, cache_status)
             self._send_json(200, json.dumps({
                 'values': values,
                 'steps': list(RADAR_NOWCAST_OFFSETS_MINUTES),
-                'radarTime': curr['time'],
-                'radarPrevTime': prev['time']
+                'radarTime': curr['time']
             }), cache_status)
             return
 

@@ -546,10 +546,13 @@ function weatherGridCell(lon, lat) {
 // step index lines up with the same offset the server computed. There's no
 // shared config file, same as the weather grid steps below; if you change
 // one, change the other.
-// -15 is a real past radar observation (the "prev" frame server.py already
-// fetches for motion estimation — see fetchVenuePrecipitation), not a
-// nowcast like +15/+30 are. Must match server.py's RADAR_NOWCAST_OFFSETS_MINUTES.
-const TIMELINE_OFFSETS_MINUTES = [-15, 0, 15, 30];
+// -10 to +50 in 5-minute steps — only 0 is a true unprojected observation
+// now; every other step (negative or positive) is the same motion-vector
+// projection from the current radar frame, just with a smaller/larger
+// time offset (see radar_value_at_offset in server.py). Must match
+// server.py's RADAR_NOWCAST_OFFSETS_MINUTES.
+const TIMELINE_OFFSETS_MINUTES = [];
+for (let m = -10; m <= 50; m += 5) TIMELINE_OFFSETS_MINUTES.push(m);
 
 async function fetchYrWeather(cell) {
   const emptyStep = offset => ({
@@ -665,7 +668,7 @@ async function fetchVenuePrecipitation(venues) {
     const [lon, lat] = f.geometry.coordinates;
     return [lat, lon];
   });
-  if (!points.length) return { time: null, prevTime: null, stale: false };
+  if (!points.length) return { time: null, stale: false };
   const nowIdx = TIMELINE_OFFSETS_MINUTES.indexOf(0);
   try {
     const res = await fetch('/api/precipitation', {
@@ -677,27 +680,26 @@ async function fetchVenuePrecipitation(venues) {
     const data = await res.json();
     const stale = res.headers.get('X-Cache') === 'STALE';
     venues.features.forEach((f, i) => {
-      // values[i] is a 4-entry array [-15, now, +15, +30] mm/h, in the
-      // same TIMELINE_OFFSETS_MINUTES order the server used
-      // (RADAR_NOWCAST_OFFSETS_MINUTES). -15 and 0 are real observations
-      // (the server's "prev"/"curr" frames read directly); +15/+30 are
-      // semi-Lagrangian nowcast estimates (see radar_value_at_offset in
-      // server.py) and only ever have as much confidence as that method
-      // affords.
+      // values[i] is a 13-entry array (-10 to +50 in 5-minute steps), in
+      // the same TIMELINE_OFFSETS_MINUTES order the server used
+      // (RADAR_NOWCAST_OFFSETS_MINUTES). Only the 0 (Now) entry is a real
+      // observation (server reads the current frame directly); every
+      // other entry, past or future, is a semi-Lagrangian nowcast
+      // estimate (see radar_value_at_offset in server.py) and only ever
+      // has as much confidence as that method affords — more reliable
+      // close to 0, less reliable further out either direction.
       const steps = data.values[i] || [];
       f.properties.precipitation = typeof steps[nowIdx] === 'number' ? steps[nowIdx] : null;
       f.properties.precipitationTime = data.radarTime || null;
-      f.properties.precipitationPrevTime = data.radarPrevTime || null;
       f.properties.precipitationStale = stale;
       f.properties.precipitationStepsJson = JSON.stringify(steps);
     });
-    return { time: data.radarTime || null, prevTime: data.radarPrevTime || null, stale };
+    return { time: data.radarTime || null, stale };
   } catch (err) {
     console.error('DMI radar fetch failed', err);
     venues.features.forEach(f => {
       f.properties.precipitation = null;
       f.properties.precipitationTime = null;
-      f.properties.precipitationPrevTime = null;
       f.properties.precipitationStale = false;
       f.properties.precipitationStepsJson = JSON.stringify(TIMELINE_OFFSETS_MINUTES.map(() => null));
     });
@@ -903,9 +905,20 @@ const MAP_STYLES = {
 };
 const BUILDING_COLOR = { night: '#151f33', day: '#c3ccd9' };
 
+// Switches at civil twilight (sun 6° below the horizon), not at geometric
+// sunrise/sunset (0°) — Copenhagen's flat terrain and open horizon mean
+// there's still real ambient daylight for a while after the sun's actual
+// altitude crosses 0°, so a 0° threshold made the dark theme kick in
+// while it visibly still looked light outside. This single threshold
+// gives a buffer on both ends for free: day theme now starts ~20-30
+// minutes before actual sunrise and lasts ~20-30 minutes past actual
+// sunset (varies by season/day length), matching perceived daylight
+// more closely than the geometric horizon does.
+const CIVIL_TWILIGHT_ALTITUDE_RAD = -6 * (Math.PI / 180);
+
 function computeTheme() {
   const alt = SunCalc.getPosition(new Date(), COPENHAGEN_CENTER[1], COPENHAGEN_CENTER[0]).altitude;
-  return alt > 0 ? 'day' : 'night';
+  return alt > CIVIL_TWILIGHT_ALTITUDE_RAD ? 'day' : 'night';
 }
 
 let currentTheme = computeTheme();
@@ -1392,15 +1405,14 @@ function openVenueDetail(feature) {
     // own timestamp and stale flag rather than sharing weatherTime/
     // weatherStale. Same ISO-string-until-render-time convention as
     // weatherTime, for the same MapLibre GeoJSON round-tripping reason.
-    // At -15/0 this is a real observation ("Radar as of…" — -15 reads the
-    // "prev" frame directly, 0 reads "curr" directly); at +15/+30 it's a
-    // semi-Lagrangian nowcast estimate, not an observation, so the render
-    // below labels it "forecast" instead — see radar_value_at_offset in
-    // server.py for what that estimate actually is (and isn't).
+    // Only offset 0 is a real observation ("Radar as of…"); every other
+    // step, past or future, is a semi-Lagrangian nowcast estimate, not an
+    // observation, so the render below labels it "forecast" instead —
+    // see radar_value_at_offset in server.py for what that estimate
+    // actually is (and isn't).
     precipitation: precipStep,
     precipitationOffsetMinutes: TIMELINE_OFFSETS_MINUTES[stepIdx],
     precipitationTime: p.precipitationTime ? new Date(p.precipitationTime) : null,
-    precipitationPrevTime: p.precipitationPrevTime ? new Date(p.precipitationPrevTime) : null,
     precipitationStale: p.precipitationStale
   };
   const areaLabel = areaData ? areaData.area.label : '';
@@ -1456,13 +1468,13 @@ function openVenueDetail(feature) {
       ${weather.weatherTime ? `<div class="vd-station">Weather forecast for ${weather.weatherTime.toLocaleTimeString('da-DK', { hour: '2-digit', minute: '2-digit' })}</div>` : ''}
       ${weather.precipitationTime ? `<div class="vd-station">${(() => {
         const fmt = d => d.toLocaleTimeString('da-DK', { hour: '2-digit', minute: '2-digit' });
-        if (weather.precipitationOffsetMinutes < 0) {
-          // A real past observation — the server's "prev" radar frame,
-          // fetched fresh each cache window, not derived from an assumed
-          // offset — so this uses its own actual timestamp, not
-          // precipitationTime minus 15.
-          return weather.precipitationPrevTime ? `Radar as of ${fmt(weather.precipitationPrevTime)}` : '';
-        }
+        // Only offset 0 is a true unprojected observation now (see
+        // radar_value_at_offset in server.py) — every other step, past or
+        // future, is the same motion-vector projection from the current
+        // frame, just with a smaller/larger time offset. -10/-5 aren't
+        // "real" any more than +45/+50 are, just closer to the two real
+        // frames the motion estimate came from, so more trustworthy —
+        // not a different kind of value.
         if (weather.precipitationOffsetMinutes === 0) return `Radar as of ${fmt(weather.precipitationTime)}`;
         return `Rain forecast for ${fmt(new Date(weather.precipitationTime.getTime() + weather.precipitationOffsetMinutes * 60000))} (nowcast)`;
       })()}</div>` : ''}
@@ -1535,17 +1547,21 @@ const timelineTrackEl = document.querySelector('.timeline-track');
 const timelineFillEl = document.querySelector('.timeline-fill');
 const timelineHandleEl = document.querySelector('.timeline-handle');
 const timelineLabelEl = document.getElementById('timeline-label');
-const timelineStopEls = [...document.querySelectorAll('.timeline-stop')];
+const timelinePrevBtn = document.getElementById('timeline-prev');
+const timelineNextBtn = document.getElementById('timeline-next');
 // Fallback only, shown before any area has loaded (the timeline itself is
 // hidden then anyway — see renderPanel) — real clock times always replace
-// these once radar data is in, per an explicit design call: relative
+// this once radar data is in, per an explicit design call: relative
 // labels ("-15 min"/"Now"/etc.) implied a precision relative to *your*
 // clock that the data doesn't actually have. DMI's radar composite lags
 // real time by ~8-12 minutes on its own (confirmed live — see
 // RADAR_CACHE_TTL_SECONDS in server.py), so "Now" showing a clock time
 // from several minutes ago is honest, not a bug; a generic "Now" label
 // papered over that gap in a way that read as broken instead.
-const TIMELINE_STEP_LABELS = { '-15': '-15 min', 0: 'Now', 15: '+15 min', 30: '+30 min' };
+function timelineFallbackLabel(offset) {
+  if (offset === 0) return 'Now';
+  return offset > 0 ? `+${offset} min` : `${offset} min`;
+}
 // offset -> Date, populated from the radar response in loadArea. The
 // radar composite is one shared Denmark-wide file (not per-area), so
 // these clock times are the same regardless of which loaded area last
@@ -1559,23 +1575,23 @@ function timelinePercentForOffset(offset) {
 
 function timelineClockLabel(offset) {
   const d = timelineClockTimes[offset];
-  return d ? d.toLocaleTimeString('da-DK', { hour: '2-digit', minute: '2-digit' }) : TIMELINE_STEP_LABELS[offset];
+  return d ? d.toLocaleTimeString('da-DK', { hour: '2-digit', minute: '2-digit' }) : timelineFallbackLabel(offset);
 }
 
-// Updates the 4 steps' real clock times from the latest radar fetch —
-// radarTime/radarPrevTime are the "curr"/"prev" frames' own actual
-// observation times (see fetchVenuePrecipitation); +15/+30 are labeled
-// relative to radarTime (the nowcast's own baseline), not device time,
-// since that's what the underlying prediction is actually anchored to.
-function updateTimelineClockTimes(radarTimeIso, radarPrevTimeIso) {
+// Updates every step's real clock time from the latest radar fetch —
+// radarTime is the "curr" frame's own actual observation time (see
+// fetchVenuePrecipitation); every step is labeled relative to radarTime
+// (the nowcast's own baseline), not device time, since that's what the
+// underlying prediction is actually anchored to. Only the 0 step is a
+// true observation; every other step (negative or positive) is a
+// projection, but all get a real clock label either way.
+function updateTimelineClockTimes(radarTimeIso) {
   if (!radarTimeIso) return;
   const radarTime = new Date(radarTimeIso);
-  timelineClockTimes = {
-    '-15': radarPrevTimeIso ? new Date(radarPrevTimeIso) : null,
-    0: radarTime,
-    15: new Date(radarTime.getTime() + 15 * 60000),
-    30: new Date(radarTime.getTime() + 30 * 60000)
-  };
+  timelineClockTimes = {};
+  for (const offset of TIMELINE_OFFSETS_MINUTES) {
+    timelineClockTimes[offset] = new Date(radarTime.getTime() + offset * 60000);
+  }
   renderTimelinePosition();
 }
 
@@ -1584,12 +1600,10 @@ function renderTimelinePosition() {
   timelineHandleEl.style.left = `${pct}%`;
   timelineFillEl.style.width = `${pct}%`;
   timelineHandleEl.setAttribute('aria-valuenow', String(timelineOffsetMinutes));
-  timelineStopEls.forEach(el => {
-    const offset = Number(el.dataset.offset);
-    el.classList.toggle('active', offset === timelineOffsetMinutes);
-    el.setAttribute('aria-label', timelineClockLabel(offset));
-  });
   timelineLabelEl.textContent = timelineClockLabel(timelineOffsetMinutes);
+  const idx = TIMELINE_OFFSETS_MINUTES.indexOf(timelineOffsetMinutes);
+  timelinePrevBtn.disabled = idx <= 0;
+  timelineNextBtn.disabled = idx >= TIMELINE_OFFSETS_MINUTES.length - 1;
 }
 
 // Re-renders whatever's currently on screen for the newly-picked step —
@@ -1604,10 +1618,6 @@ function setTimelineOffset(minutes) {
   if (currentVenueFeature) openVenueDetail(currentVenueFeature);
 }
 
-timelineStopEls.forEach(el => {
-  el.addEventListener('click', () => setTimelineOffset(Number(el.dataset.offset)));
-});
-
 function timelineOffsetForClientX(clientX) {
   const rect = timelineTrackEl.getBoundingClientRect();
   const pct = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
@@ -1615,16 +1625,31 @@ function timelineOffsetForClientX(clientX) {
   return TIMELINE_OFFSETS_MINUTES[idx];
 }
 
-// Clicking anywhere on the track (not just the 3 dots) jumps to whichever
-// stop is nearest the click — a bigger, easier target than the dots alone.
+function stepTimeline(direction) {
+  const idx = TIMELINE_OFFSETS_MINUTES.indexOf(timelineOffsetMinutes);
+  const nextIdx = idx + direction;
+  if (nextIdx < 0 || nextIdx >= TIMELINE_OFFSETS_MINUTES.length) return;
+  setTimelineOffset(TIMELINE_OFFSETS_MINUTES[nextIdx]);
+}
+
+timelinePrevBtn.addEventListener('click', () => stepTimeline(-1));
+timelineNextBtn.addEventListener('click', () => stepTimeline(1));
+
+// No individual stop dots any more — 13 steps is too many to render as
+// discrete clickable targets usefully (see TIMELINE_OFFSETS_MINUTES).
+// Clicking anywhere on the track jumps to whichever step is nearest the
+// click; dragging the handle (below) does the same continuously.
 timelineTrackEl.addEventListener('click', e => {
-  if (e.target === timelineHandleEl || e.target.classList.contains('timeline-stop')) return;
+  if (e.target === timelineHandleEl) return;
   setTimelineOffset(timelineOffsetForClientX(e.clientX));
 });
 
-// Dragging the handle live-previews its position under the pointer, then
-// snaps to the nearest of the 3 real data points on release — there's
-// nothing to show in between, only Now/+15/+30 were ever fetched.
+// Dragging the handle updates the label/data live, snapped to the
+// nearest step, on every pointermove — not just on release — so sliding
+// left/right shows exactly where you'll land the whole time, not only
+// after letting go. setTimelineOffset already no-ops when the step
+// hasn't changed, so this doesn't re-render on every pixel of movement,
+// only when the snapped step actually changes.
 let timelineDragging = false;
 timelineHandleEl.addEventListener('pointerdown', e => {
   timelineDragging = true;
@@ -1632,23 +1657,14 @@ timelineHandleEl.addEventListener('pointerdown', e => {
 });
 timelineHandleEl.addEventListener('pointermove', e => {
   if (!timelineDragging) return;
-  const rect = timelineTrackEl.getBoundingClientRect();
-  const pct = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width)) * 100;
-  timelineHandleEl.style.left = `${pct}%`;
-  timelineFillEl.style.width = `${pct}%`;
-});
-timelineHandleEl.addEventListener('pointerup', e => {
-  if (!timelineDragging) return;
-  timelineDragging = false;
   setTimelineOffset(timelineOffsetForClientX(e.clientX));
 });
+timelineHandleEl.addEventListener('pointerup', () => {
+  timelineDragging = false;
+});
 timelineHandleEl.addEventListener('keydown', e => {
-  const idx = TIMELINE_OFFSETS_MINUTES.indexOf(timelineOffsetMinutes);
-  if (e.key === 'ArrowRight' && idx < TIMELINE_OFFSETS_MINUTES.length - 1) {
-    setTimelineOffset(TIMELINE_OFFSETS_MINUTES[idx + 1]);
-  } else if (e.key === 'ArrowLeft' && idx > 0) {
-    setTimelineOffset(TIMELINE_OFFSETS_MINUTES[idx - 1]);
-  }
+  if (e.key === 'ArrowRight') stepTimeline(1);
+  else if (e.key === 'ArrowLeft') stepTimeline(-1);
 });
 
 renderTimelinePosition();
@@ -1744,7 +1760,7 @@ async function loadArea(areaId) {
     fetchVenueWeather(venues).then(r => { markStepDone('weather'); return r; }),
     fetchVenuePrecipitation(venues).then(r => { markStepDone('radar'); return r; })
   ]);
-  updateTimelineClockTimes(radar.time, radar.prevTime);
+  updateTimelineClockTimes(radar.time);
   const sun = getSunInfo(center[1], center[0]);
 
   setLoadingText('Tracing shadows…');

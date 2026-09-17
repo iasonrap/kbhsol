@@ -91,25 +91,28 @@ those load; nothing loads until you choose.
   figure at all (`—`), not 0 mm/h — a genuine "radar detected nothing
   here" 0 and a missing reading are different things, and this app never
   conflates the two (same rule cloud cover already follows).
-- **A 4-stop timeline, not just "right now."** A bottom-center control
-  (click a stop, or drag the handle — it snaps to the nearest one) scrubs
-  between 4 steps, each labeled with its own real clock time (not a
-  relative "-15 min"/"Now" — DMI's radar naturally lags real time by
-  several minutes, so a relative label implied a precision the data
-  didn't have). The first two steps are real radar observations; the
-  last two are a nowcast. Getting there needs two
+- **A 13-step timeline, not just "right now."** A bottom-center control
+  (click anywhere on the track, or drag the handle — it snaps to the
+  nearest step) scrubs from -10 to +50 minutes in 5-minute steps, each
+  labeled with its own real clock time (not relative text like "-10 min"
+  — DMI's radar naturally lags real time by several minutes, so a
+  relative label implied a precision the data didn't have). Only the
+  exact "now" step is a real, unprojected radar observation; every other
+  step, past or future, is the same nowcast estimate, just closer to or
+  further from that one real reading (so -5 min is more trustworthy than
+  -10, the same way +5 is more trustworthy than +50 — proximity to the
+  real observation, not sign, is what matters). Getting there needs two
   radar frames, not one: `server.py` fetches the newest composite plus
-  whichever earlier one is closest to a 15-minute gap before it — that
-  earlier frame IS the -15m step, shown directly, not derived — and
+  whichever earlier one is closest to a 15-minute gap before it, and
   estimates a single citywide motion vector between the two (FFT phase
   correlation on a downsampled pair of frames — one overall drift
   direction/speed, not per-storm-cell tracking, so it can't capture a
-  cell growing, shrinking, or rotating, only its broad movement). The
-  +15/+30 figures then read the *current* frame at the position that
-  motion vector says will drift into each venue by that time, rather
-  than assuming nothing changes. If there's no rain in either frame to
-  correlate, the estimate falls back to "no motion," and +15/+30 just
-  repeat the current reading — the honest answer
+  cell growing, shrinking, or rotating, only its broad movement). Every
+  non-zero step then reads the *current* frame at the position that
+  motion vector says will drift into (or out of) each venue by that
+  time, rather than assuming nothing changes. If there's no rain in
+  either frame to correlate, the estimate falls back to "no motion," and
+  the whole timeline just repeats the current reading — the honest answer
   when there's nothing to track. Yr's temperature/wind/cloud scrub on the
   same timeline for free: its response already contains a multi-hour
   timeseries, not just one entry, so each step just reads whichever entry
@@ -243,11 +246,17 @@ your laptop to use the app there too, no extra setup needed.
   buildings, weather, shadows) so you can see what stage it's at.
 - The footer has a GitHub link and a "Built with Claude" note.
 - **The whole UI theme follows the actual sun** in Copenhagen: dark navy
-  (the default identity) after sunset, switching automatically to a light
-  grey/baby-blue theme — including the base map style — while the sun is
-  genuinely up. Checked once on load and every 10 minutes after (`app.js`'s
-  `computeTheme`/`switchTheme`), so a tab left open across sunrise/sunset
-  will flip on its own. The 🌙/☀️ button in the header toggles it manually
+  (the default identity) at night, switching automatically to a light
+  grey/baby-blue theme — including the base map style — while it's light
+  out. The switch happens at civil twilight (sun 6° below the horizon),
+  not exact sunrise/sunset — Copenhagen's flat, open terrain means there's
+  still real daylight for a while past geometric sunset, so using 0° made
+  the dark theme kick in noticeably before it actually looked dark. This
+  gives a buffer on both ends: day theme starts ~20-30 minutes before
+  actual sunrise and lasts ~20-30 minutes past actual sunset. Checked once
+  on load and every 10 minutes after (`app.js`'s `computeTheme`/
+  `switchTheme`), so a tab left open across sunrise/sunset will flip on
+  its own. The 🌙/☀️ button in the header toggles it manually
   at any time — doing so stops the automatic sunrise/sunset checks for the
   rest of the session, so your choice sticks. Venue marker colors (the
   sun/shade states) don't change between themes — they're semantic, not

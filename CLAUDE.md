@@ -238,16 +238,29 @@ No build step, no bundler, no npm — everything loads from CDNs
     first — there's nothing to dedupe against, since answering any point
     costs the same cheap array lookup once the pair is cached and its
     motion estimated, not a new upstream call.
-  - **The timeline (-15/Now/+15/+30) is `RADAR_NOWCAST_OFFSETS_MINUTES`
-    in `server.py` / `TIMELINE_OFFSETS_MINUTES` in `app.js` — keep them in
-    sync, no shared config file, same as the weather grid steps. -15 is a
-    real observation (the "prev" frame, read directly at offset 0 into
-    itself — see the route handler's `value_for` closure), not a nowcast
-    like +15/+30 — don't run it through `radar_value_at_offset`'s motion
-    projection, or it'd silently become a prediction of the past instead
-    of what actually happened. `fetch_dmi_radar_pair`'s
-    `target_gap_minutes` is 15 (not the original 10) specifically so the
-    "prev" frame it picks actually lines up with the -15m label.**
+  - **The timeline is `RADAR_NOWCAST_OFFSETS_MINUTES` in `server.py` /
+    `TIMELINE_OFFSETS_MINUTES` in `app.js` — keep them in sync, no shared
+    config file, same as the weather grid steps. Currently -10 to +50 in
+    5-minute steps (13 total), stress-testing the motion model's range on
+    request.** Only offset 0 is a true unprojected observation (reads
+    curr directly, frac=0) — every other step, negative or positive,
+    goes through `radar_value_at_offset`'s SAME semi-Lagrangian
+    projection from curr along the single motion vector. This is a
+    deliberate change from an earlier version where negative offsets
+    read the "prev" frame's own raw value directly as a real
+    observation — that only worked with exactly one negative step (-15)
+    that happened to be targeted to roughly match prev's actual ~15-
+    minute gap; it doesn't generalize to multiple negative steps on a
+    fine grid, since prev is only ONE frame at ONE actual timestamp (-10
+    and -5 would've shown identical values reading it directly). If you
+    ever reduce the step count back down to something coarse, don't
+    reflexively bring the "negative reads prev directly" special case
+    back without checking whether it still makes sense at that grid
+    density. `fetch_dmi_radar_pair`'s `target_gap_minutes` (15) no longer
+    needs to line up with any specific displayed step — it now only
+    affects motion-estimate quality (too short a gap: noisy velocity from
+    500m pixel quantization; too long: assumes linear motion over a
+    longer window, risking more error for fast-changing storms).
   - **`get_radar_nowcast_state()` caches the DECODED frames and motion
     vector in memory, not just the raw bytes** — without it, every single
     `/api/precipitation` request re-decoded both HDF5 files and re-ran
@@ -274,25 +287,49 @@ No build step, no bundler, no npm — everything loads from CDNs
     conj(fa)` (not `fa * conj(fb)`, which is backwards) gives the correct
     prev→curr motion direction; getting this backwards would have
     silently predicted rain moving the wrong way with no error to catch
-    it. `radar_value_at_offset` then does semi-Lagrangian backward
-    sampling — to predict what's at a fixed point in the future, it reads
-    the CURRENT frame at the position upstream along the motion vector,
-    not the current frame at that same fixed point. If either frame has
-    no rain signal at all (`np.any(a)`/`np.any(b)` both false), motion
-    falls back to `(0, 0)` — the nowcast then degrades to persistence
-    (+15/+30 equal the current reading), which is the *correct* behavior
-    for "nothing to track," not a bug. The client (`fetchVenuePrecipitation`
-    in `app.js`) fetches all 3 steps in one POST per area load, not 3
-    separate requests — `timelineStepIndex()`/`setTimelineOffset()`
-    switch which already-downloaded step is displayed instantly, no
-    re-fetch on scrub. **Yr's temp/wind/cloud get the same 3-step
-    treatment for free** (`fetch_yr_weather` now returns a `steps` array,
-    one entry per offset, each just the nearest timeseries entry to
-    now+offset from the SAME single Yr response — no extra upstream cost,
-    since Yr's timeseries already covers many hours, we're just reading 3
-    different points in one response instead of 1). Since Yr's near-term
-    resolution is hourly, steps that don't cross an hour boundary often
-    resolve to the identical entry — expected, not a bug.
+    it. `radar_value_at_offset` does semi-Lagrangian sampling for any
+    non-zero offset (past or future) — to predict what's at a fixed
+    point at curr's time plus that offset, it reads the CURRENT frame at
+    the position upstream (or downstream, for a negative offset) along
+    the motion vector, not the current frame at that same fixed point.
+    This is more trustworthy close to offset 0 than far from it — a
+    single global linear vector can't capture a storm turning, growing,
+    or dissipating over a longer window, so error compounds with
+    distance from curr in either direction; there's no per-step
+    confidence indicator for this in the UI currently, just the general
+    understanding that steps far from 0 are less reliable. If either
+    frame has no rain signal at all (`np.any(a)`/`np.any(b)` both false),
+    motion falls back to `(0, 0)` — the whole timeline then degrades to
+    persistence (every step equals the current reading), which is the
+    *correct* behavior for "nothing to track," not a bug. The client
+    (`fetchVenuePrecipitation` in `app.js`) fetches all steps in one POST
+    per area load, not one request per step — `timelineStepIndex()`/
+    `setTimelineOffset()` switch which already-downloaded step is
+    displayed instantly, no re-fetch on scrub. **Yr's temp/wind/cloud get
+    the same multi-step treatment for free** (`fetch_yr_weather` returns
+    a `steps` array, one entry per offset, each just the nearest
+    timeseries entry to now+offset from the SAME single Yr response — no
+    extra upstream cost, since Yr's timeseries already covers many hours,
+    we're just reading N different points in one response instead of 1).
+    Since Yr's near-term resolution is hourly, steps that don't cross an
+    hour boundary often resolve to the identical entry — expected, not a
+    bug.
+  - **The timeline UI has no individual per-step dot buttons any more —
+    just a draggable handle on a track with light tick marks (CSS
+    `repeating-linear-gradient` on `.timeline-track::after`), not 13 DOM
+    elements.** This is a deliberate change from the original 4-step
+    design, which rendered one `<button class="timeline-stop">` per
+    offset with a hardcoded `left` percentage per `data-offset` value in
+    CSS — that doesn't scale past a handful of steps (13 individually
+    clickable dots on a ~280px track would be unusably small targets, and
+    hardcoding 13 CSS position rules is exactly the kind of thing that
+    breaks the next time the step count changes). Clicking anywhere on
+    the track or dragging the handle both route through the same
+    `timelineOffsetForClientX`, which computes the nearest step generically
+    from `TIMELINE_OFFSETS_MINUTES.length` — this already scales to any
+    step count, so if the range/granularity changes again, only
+    `TIMELINE_OFFSETS_MINUTES` (`app.js`) and `RADAR_NOWCAST_OFFSETS_MINUTES`
+    (`server.py`) need to change, nothing in the click/drag handling.
   - **Only the numeric figures scrub with the timeline — venue marker
     colors, sun/shade state, and building shadows stay pinned to "now."**
     A deliberate scope decision (confirmed with the user before building
@@ -371,10 +408,21 @@ No build step, no bundler, no npm — everything loads from CDNs
     non-abusive area load: Indre By alone has 700+ venues in one POST
     body. If you add a new area with even more venues, re-check this
     isn't the bottleneck before assuming something else broke.
-- **The UI theme (dark by default, light "day" theme while the sun's up in
-  Copenhagen) is driven by `computeTheme()`/`switchTheme()` in `app.js`,
-  toggling `document.documentElement.dataset.theme` and swapping the
-  MapLibre style between `MAP_STYLES.night`/`.day`.** `map.setStyle()`
+- **The UI theme (dark by default, light "day" theme while it's actually
+  light out in Copenhagen) is driven by `computeTheme()`/`switchTheme()`
+  in `app.js`, toggling `document.documentElement.dataset.theme` and
+  swapping the MapLibre style between `MAP_STYLES.night`/`.day`.**
+  **`computeTheme()`'s threshold is civil twilight (sun 6° below the
+  horizon, `CIVIL_TWILIGHT_ALTITUDE_RAD`), not geometric sunrise/sunset
+  (0°)** — this was 0° originally, but Copenhagen's flat terrain and open
+  horizon mean there's real ambient daylight for a while after the sun's
+  actual altitude crosses 0°, so the dark theme was kicking in while it
+  visibly still looked light outside (a real, reported complaint, not a
+  theoretical one). One threshold gives a buffer on both ends for free:
+  day theme now starts ~20-30 minutes before actual sunrise and lasts
+  ~20-30 minutes past actual sunset (varies by season/day length) — don't
+  special-case morning vs. evening separately, the single comparison in
+  `computeTheme()` already covers both. `map.setStyle()`
   wipes all custom sources/layers, so every active area gets relayered
   from `areaDataCache` (raw buildings/venues GeoJSON kept in memory per
   loaded area) afterward — don't add a new per-area MapLibre layer

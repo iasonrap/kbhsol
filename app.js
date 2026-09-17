@@ -48,7 +48,10 @@ function areaCenter(bbox) {
   return [(bbox.west + bbox.east) / 2, (bbox.south + bbox.north) / 2];
 }
 
-// Cloud cover (0-100 scale) tiers, from clearest to most overcast.
+// Cloud cover (0-100 scale) tiers, from clearest to most overcast. Sourced
+// from Yr/MET Norway's cloud_area_fraction now, not DMI's — same proven
+// thresholds carried over unchanged, since this is a direct parameter swap
+// (both are "% of sky covered"), not a new metric needing new tuning.
 const CLOUD_TIERS = [
   { max: 10, state: 'sun' },
   { max: 30, state: 'partly-sunny' },
@@ -57,10 +60,12 @@ const CLOUD_TIERS = [
 ];
 
 function cloudTierState(cloudCover) {
-  // A failed/missing forecast fetch must NOT be treated as clear sky — that
-  // silently mislabeled venues as sunny when DMI's forecast endpoint (which
-  // rate-limits more aggressively than the others) failed for their grid
-  // cell. Surface it as its own "unknown" state instead of guessing.
+  // A failed/missing weather fetch must NOT be treated as clear sky — that
+  // would silently mislabel venues as sunny whenever the upstream call
+  // failed for their grid cell. Surface it as its own "unknown" state
+  // instead of guessing (a real, confirmed bug the first time this logic
+  // was written, back when it was DMI-backed — the lesson carries over
+  // regardless of which API is behind it).
   if (cloudCover == null) return 'unknown';
   return CLOUD_TIERS.find(tier => cloudCover < tier.max).state;
 }
@@ -198,11 +203,14 @@ document.querySelector('[data-view="about"]').addEventListener('click', async ()
 
 // --- Track tab (API request log + charts) --------------------------------
 //
-// Every proxied request server.py makes (Overpass venues/buildings, DMI
-// forecast tiles, DMI observation stations) is logged server-side to
-// data/api_log.jsonl regardless of whether it was a cache hit — this tab
-// visualizes that log so it's obvious whether the caching/grid-snapping
-// design is actually working, or if something's quietly spamming DMI.
+// Every proxied request server.py makes (Overpass venues/buildings, Yr
+// weather tiles) is logged server-side to data/api_log.jsonl regardless of
+// whether it was a cache hit — this tab visualizes that log so it's
+// obvious whether the caching/grid-snapping design is actually working, or
+// if something's quietly spamming an upstream API. Only two kinds now
+// ('overpass', 'weather') — DMI's old split between a forecast-per-tile
+// call and an observation-per-station call collapsed into one Yr call per
+// grid cell, so there's one weather chart instead of two.
 
 const TRACK_PALETTE = ['#ffd166', '#5e96e0', '#c76dd6', '#4caf7d', '#e0955e', '#7ad1c9', '#e05d8d', '#a3a86c'];
 
@@ -268,14 +276,9 @@ function renderTrackView(entries) {
     groupLabel: g => (AREAS[g] && AREAS[g].label) || g
   });
   renderTrackChart('chart-forecast', 'legend-forecast', entries, buckets, bucketMs, {
-    filterKind: 'forecast',
+    filterKind: 'weather',
     groupKey: e => e.cell || 'unknown',
     groupLabel: g => g
-  });
-  renderTrackChart('chart-weather', 'legend-weather', entries, buckets, bucketMs, {
-    filterKind: 'weather',
-    groupKey: e => e.stationId || 'unknown',
-    groupLabel: g => (WEATHER_STATIONS.find(s => s.id === g) || {}).name || g
   });
 
   renderTrackLogTable(entries);
@@ -386,18 +389,15 @@ function renderTrackLogTable(entries) {
     return;
   }
 
-  const KIND_LABELS = { overpass: 'Overpass', forecast: 'Forecast', weather: 'Observation' };
+  const KIND_LABELS = { overpass: 'Overpass', weather: 'Weather' };
   tbody.innerHTML = recent.map(e => {
     const time = new Date(e.ts).toLocaleString('da-DK', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
     let detail = '';
     if (e.kind === 'overpass') {
       const label = (AREAS[e.areaId] && AREAS[e.areaId].label) || e.areaId || '—';
       detail = `${escapeHtml(label)} · ${escapeHtml(e.requestKind || '')}`;
-    } else if (e.kind === 'forecast') {
-      detail = `tile ${escapeHtml(e.cell || '—')}`;
     } else if (e.kind === 'weather') {
-      const stationName = (WEATHER_STATIONS.find(s => s.id === e.stationId) || {}).name || e.stationId;
-      detail = `${escapeHtml(stationName)} · ${escapeHtml(e.parameterId || '')}`;
+      detail = `tile ${escapeHtml(e.cell || '—')}`;
     }
     const cache = escapeHtml(e.cache || '');
     return `<tr>
@@ -415,9 +415,9 @@ function bboxStr(bbox) {
   return `${bbox.south},${bbox.west},${bbox.north},${bbox.east}`;
 }
 
-// Overpass and DMI requests go through our own tiny local proxy (server.py),
-// which caches responses to disk under data/ for 20 minutes — so clicking
-// areas on/off repeatedly doesn't re-hit the public APIs each time.
+// Overpass and Yr requests go through our own tiny local proxy (server.py),
+// which caches responses to disk under data/ — so clicking areas on/off
+// repeatedly doesn't re-hit the public APIs each time.
 async function fetchOverpass(query, areaId, kind) {
   // areaId/kind are only for the Track tab's request log — appended as query
   // params rather than folded into the POST body, so they can't affect the
@@ -514,160 +514,110 @@ function overpassVenuesToGeoJSON(data) {
   return { type: 'FeatureCollection', features };
 }
 
-// --- DMI weather ------------------------------------------------------------
+// --- Yr (MET Norway) weather -------------------------------------------
 
-// Hand-picked DMI stations that report cloud_cover, temp_dry, wind_speed
-// and wind_dir together. Copenhagen's inner-city stations each only report
-// a subset (e.g. Landbohøjskolen has temperature but no wind/cloud), so we
-// pick the nearest station that actually has everything we need, rather
-// than averaging a wide bounding box (which just grabs the same stations
-// for every area and makes them all look identical).
-const WEATHER_STATIONS = [
-  { id: '06180', name: 'Kastrup', coord: [12.6455, 55.6140] },
-  { id: '06181', name: 'Jægersborg', coord: [12.5263, 55.7664] },
-  { id: '06188', name: 'Sjælsmark', coord: [12.4121, 55.8764] },
-  { id: '06170', name: 'Roskilde Lufthavn', coord: [12.1366, 55.5867] },
-  { id: '06183', name: 'Drogden Fyr', coord: [12.7114, 55.5364] }
-];
-
-function nearestWeatherStation(center) {
-  let best = null;
-  let bestDist = Infinity;
-  for (const station of WEATHER_STATIONS) {
-    const dist = turf.distance(center, station.coord, { units: 'kilometers' });
-    if (dist < bestDist) {
-      bestDist = dist;
-      best = station;
-    }
-  }
-  return { ...best, distanceKm: bestDist };
-}
-
-async function fetchDmiParameter(stationId, parameterId) {
-  const url = `/api/weather?parameterId=${parameterId}&stationId=${stationId}`;
-  try {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`DMI proxy responded ${res.status}`);
-    const data = await res.json();
-    const props = data.features && data.features[0] && data.features[0].properties;
-    const value = props && props.value;
-    return {
-      value: typeof value === 'number' ? value : null,
-      // "observed" is when the station actually took this reading, not when
-      // we fetched it — stations report on the dot every 10 minutes, so
-      // this can trail "now" by up to ~10 minutes even on a fresh (non-stale)
-      // read. Kept as an ISO string, not a Date, for the same reason
-      // forecastTime is: reconstruct the Date only at render time.
-      observed: (props && props.observed) || null,
-      stale: res.headers.get('X-Cache') === 'STALE'
-    };
-  } catch (err) {
-    console.error(`DMI fetch failed for ${parameterId}`, err);
-    return { value: null, observed: null, stale: false };
-  }
-}
-
-// Cloud cover comes from DMI's HARMONIE DINI forecast model (2km grid, read at
-// the nearest hour to now) rather than the observation stations — the model
-// gives genuinely different values area-to-area, where only ~2 stations cover
-// all of central Copenhagen. Temp/wind stay from the nearest real station.
-async function fetchForecastCloudCover(center) {
-  const [lon, lat] = center;
-  try {
-    const res = await fetch(`/api/forecast?lat=${lat}&lon=${lon}`);
-    if (!res.ok) throw new Error(`DMI forecast proxy responded ${res.status}`);
-    const data = await res.json();
-    return {
-      cloudCover: typeof data.cloudCover === 'number' ? data.cloudCover : null,
-      // The hour this forecast value is FOR, not when the model run itself
-      // was computed — DMI's API doesn't expose the latter, only each
-      // step's valid time.
-      forecastTime: data.time ? new Date(data.time) : null,
-      // Server fell back to a cached response older than its normal TTL
-      // because the live DMI fetch failed (usually rate-limiting) — the
-      // data shown may be meaningfully out of date, surface that.
-      stale: res.headers.get('X-Cache') === 'STALE'
-    };
-  } catch (err) {
-    console.error('DMI forecast fetch failed', err);
-    return { cloudCover: null, forecastTime: null, stale: false };
-  }
-}
-
-// Temp/wind still come from one nearest observation station per area (see
-// "Weather is per-area, not per-venue" in CLAUDE.md) — only cloud cover is
-// read per-venue now, via fetchVenueForecasts below.
-async function fetchStationWeather(center) {
-  const station = nearestWeatherStation(center);
-  const [temp, wSpeed, wDir] = await Promise.all([
-    fetchDmiParameter(station.id, 'temp_dry'),
-    fetchDmiParameter(station.id, 'wind_speed'),
-    fetchDmiParameter(station.id, 'wind_dir')
-  ]);
-  return {
-    temperature: temp.value,
-    windSpeed: wSpeed.value,
-    windDir: wDir.value,
-    // temp_dry's observed time stands in for "when this reading was taken" —
-    // the station reports all three parameters on the same 10-minute tick,
-    // so in practice all three timestamps agree; temp is just the one always
-    // fetched, so it's the representative one rather than picking arbitrarily.
-    observedTime: temp.observed,
-    obsStale: temp.stale || wSpeed.stale || wDir.stale,
-    station
-  };
-}
-
-// Must match server.py's FORECAST_GRID_*_STEP — kept in sync by hand since
+// Must match server.py's WEATHER_GRID_*_STEP — kept in sync by hand since
 // there's no shared config file. The server re-snaps anyway (it's the
 // authority on cache keys), but snapping client-side first means an area's
 // worth of venues collapses into one fetch per distinct cell instead of one
 // per venue, before any request is even sent.
-const FORECAST_GRID_LAT_STEP = 0.018;
-const FORECAST_GRID_LON_STEP = 0.032;
+const WEATHER_GRID_LAT_STEP = 0.018;
+const WEATHER_GRID_LON_STEP = 0.032;
 
-function forecastGridCell(lon, lat) {
-  const snappedLat = Math.round(lat / FORECAST_GRID_LAT_STEP) * FORECAST_GRID_LAT_STEP;
-  const snappedLon = Math.round(lon / FORECAST_GRID_LON_STEP) * FORECAST_GRID_LON_STEP;
+function weatherGridCell(lon, lat) {
+  const snappedLat = Math.round(lat / WEATHER_GRID_LAT_STEP) * WEATHER_GRID_LAT_STEP;
+  const snappedLon = Math.round(lon / WEATHER_GRID_LON_STEP) * WEATHER_GRID_LON_STEP;
   return { key: `${snappedLat.toFixed(4)},${snappedLon.toFixed(4)}`, lat: snappedLat, lon: snappedLon };
 }
 
-// Cloud cover is read at each venue's own coordinate (snapped to the model's
-// ~2km grid) rather than once at the area's center — a venue near an area's
-// edge can genuinely sit in a different forecast cell than its own area's
-// center (e.g. an Østerbro café close to the Nordhavn border), so sharing one
-// area-wide reading across every venue was giving edge venues the wrong
-// number. Venues are grouped by grid cell first, so this is one fetch per
-// distinct cell actually in play, not one per venue.
-async function fetchVenueForecasts(venues) {
+async function fetchYrWeather(cell) {
+  try {
+    const res = await fetch(`/api/weather?lat=${cell.lat}&lon=${cell.lon}`);
+    if (!res.ok) throw new Error(`Yr weather proxy responded ${res.status}`);
+    const data = await res.json();
+    return {
+      temperature: typeof data.temperature === 'number' ? data.temperature : null,
+      windSpeed: typeof data.windSpeed === 'number' ? data.windSpeed : null,
+      windDir: typeof data.windDir === 'number' ? data.windDir : null,
+      cloudCover: typeof data.cloudCover === 'number' ? data.cloudCover : null,
+      // Yr's own "how sunny does this look" classification (e.g.
+      // "clearsky_day"/"partlycloudy_day"/"cloudy") — not used to drive the
+      // sun/shade tiering (cloudCover does that, same proven thresholds as
+      // before), but shown alongside it as a nice human-readable label MET
+      // Norway's forecasters already tuned, rather than us reinventing one.
+      symbolCode: data.symbolCode || null,
+      // The timeseries entry this reading is FOR, not when we fetched it —
+      // kept as an ISO string, not a Date: GeoJSON feature properties get
+      // round-tripped through MapLibre's tiling worker (addSource -> click
+      // event), which silently coerces a Date into a plain string anyway
+      // (a real, confirmed bug the first time this was tried) — reconstruct
+      // the Date only at render time instead (see openVenueDetail).
+      time: data.time || null,
+      // Server fell back to a cached response older than its normal expiry
+      // because the live Yr fetch failed — the data shown may be out of
+      // date, surface that.
+      stale: res.headers.get('X-Cache') === 'STALE'
+    };
+  } catch (err) {
+    console.error('Yr weather fetch failed', err);
+    return { temperature: null, windSpeed: null, windDir: null, cloudCover: null, symbolCode: null, time: null, stale: false };
+  }
+}
+
+// Weather (temp/wind/cloud together) is read at each venue's own coordinate
+// (snapped to a shared ~2km grid) rather than once at the area's center —
+// a venue near an area's edge can genuinely sit in a different weather cell
+// than its own area's center (e.g. an Østerbro café close to the Nordhavn
+// border), so sharing one area-wide reading across every venue was giving
+// edge venues the wrong numbers. Venues are grouped by grid cell first, so
+// this is one fetch per distinct cell actually in play, not one per venue —
+// and, since Yr's Locationforecast API bundles temp/wind/cloud into one
+// response, one fetch covers all three at once, not three separate calls
+// per cell the way DMI's split observation/forecast APIs needed.
+async function fetchVenueWeather(venues) {
   const cells = new Map(); // cellKey -> { key, lat, lon }
   for (const f of venues.features) {
     const [lon, lat] = f.geometry.coordinates;
-    const cell = forecastGridCell(lon, lat);
+    const cell = weatherGridCell(lon, lat);
     if (!cells.has(cell.key)) cells.set(cell.key, cell);
   }
 
-  const results = new Map(); // cellKey -> { cloudCover, forecastTime, stale }
+  const results = new Map(); // cellKey -> fetchYrWeather() result
   await Promise.all([...cells.values()].map(async cell => {
-    results.set(cell.key, await fetchForecastCloudCover([cell.lon, cell.lat]));
+    results.set(cell.key, await fetchYrWeather(cell));
   }));
 
   for (const f of venues.features) {
     const [lon, lat] = f.geometry.coordinates;
-    const forecast = results.get(forecastGridCell(lon, lat).key);
-    f.properties.cloudCover = forecast.cloudCover;
-    // Store as an ISO string, not a Date — GeoJSON feature properties get
-    // round-tripped through MapLibre's tiling worker (addSource -> click
-    // event), which coerces a Date into a plain string anyway. Keeping a
-    // Date object here works right up until the first click, then throws
-    // ("...toLocaleTimeString is not a function") since what comes back
-    // out is a string masquerading as a Date — reconstruct it explicitly
-    // at render time instead (see openVenueDetail).
-    f.properties.forecastTime = forecast.forecastTime ? forecast.forecastTime.toISOString() : null;
-    f.properties.forecastStale = forecast.stale;
+    const w = results.get(weatherGridCell(lon, lat).key);
+    f.properties.temperature = w.temperature;
+    f.properties.windSpeed = w.windSpeed;
+    f.properties.windDir = w.windDir;
+    f.properties.cloudCover = w.cloudCover;
+    f.properties.symbolCode = w.symbolCode;
+    f.properties.weatherTime = w.time;
+    f.properties.weatherStale = w.stale;
   }
 
   return results;
+}
+
+// Circular mean, not a plain arithmetic average — wind direction wraps at
+// 360°, so naively averaging e.g. 350° and 10° gives 180° (due south, the
+// exact opposite of correct) instead of 0° (due north, the right answer).
+// Averaged over each distinct grid cell's own reading, for the area-wide
+// summary shown in the top panel — a venue's own detail panel still shows
+// its own cell's un-averaged direction.
+function circularMeanDegrees(degrees) {
+  if (!degrees.length) return null;
+  let sinSum = 0, cosSum = 0;
+  for (const d of degrees) {
+    const rad = d * Math.PI / 180;
+    sinSum += Math.sin(rad);
+    cosSum += Math.cos(rad);
+  }
+  const meanRad = Math.atan2(sinSum / degrees.length, cosSum / degrees.length);
+  return (meanRad * 180 / Math.PI + 360) % 360;
 }
 
 function windDirCompass(deg) {
@@ -1080,26 +1030,50 @@ function formatWeatherValue(value, unit, decimals = 0) {
   return value == null ? '—' : `${value.toFixed(decimals)}${unit}`;
 }
 
-// Cloud cover and temp/wind are two genuinely separate DMI calls
-// (/api/forecast vs /api/weather — see "Cloud cover and temp/wind come
-// from two different DMI APIs" in CLAUDE.md), and they fail independently
-// of each other — DMI's forecast endpoint rate-limits noticeably harder
-// than the observation one, so it's common for only one of the two to be
-// stale at a time. A single combined "DMI's data is unavailable" note
-// used to blur that together, which was confusing — no way to tell
-// whether the cloud reading, the temp/wind reading, or both were the
-// cached one. Each gets called out separately here instead, and only
-// when it's actually stale — no news is fresh news, same as everywhere
+// Yr's symbol_code (e.g. "partlycloudy_day", "lightrainshowers_night") is
+// MET Norway's own human-facing "how does this look" classification —
+// shown as a bonus label next to the numeric weather tiles, not used to
+// drive sun/shade tiering (cloudCover still does that). Covers the common
+// Danish weather categories explicitly; anything unmapped (heavier
+// precipitation/thunder variants, mostly) falls back to a generic icon and
+// the code's own words spaced out, rather than silently showing nothing.
+const SYMBOL_INFO = {
+  clearsky: { icon: '☀️', label: 'Clear sky' },
+  fair: { icon: '🌤️', label: 'Fair' },
+  partlycloudy: { icon: '⛅', label: 'Partly cloudy' },
+  cloudy: { icon: '☁️', label: 'Cloudy' },
+  fog: { icon: '🌫️', label: 'Fog' },
+  rain: { icon: '🌧️', label: 'Rain' },
+  lightrain: { icon: '🌦️', label: 'Light rain' },
+  heavyrain: { icon: '🌧️', label: 'Heavy rain' },
+  rainshowers: { icon: '🌦️', label: 'Rain showers' },
+  lightrainshowers: { icon: '🌦️', label: 'Light rain showers' },
+  heavyrainshowers: { icon: '🌧️', label: 'Heavy rain showers' },
+  rainandthunder: { icon: '⛈️', label: 'Rain and thunder' },
+  rainshowersandthunder: { icon: '⛈️', label: 'Rain showers and thunder' },
+  sleet: { icon: '🌨️', label: 'Sleet' },
+  snow: { icon: '❄️', label: 'Snow' },
+  lightsnow: { icon: '🌨️', label: 'Light snow' },
+  heavysnow: { icon: '❄️', label: 'Heavy snow' },
+  snowshowers: { icon: '🌨️', label: 'Snow showers' }
+};
+
+function formatSymbolCode(code) {
+  if (!code) return null;
+  const base = code.replace(/_(day|night|polartwilight)$/, '');
+  if (SYMBOL_INFO[base]) return SYMBOL_INFO[base];
+  return { icon: '🌡️', label: base.charAt(0).toUpperCase() + base.slice(1) };
+}
+
+// Temp/wind/cloud all come from one Yr call per venue's grid cell now (see
+// fetchVenueWeather) — DMI used to split these across two APIs that failed
+// independently, which is why this used to show two separate stale notes.
+// One combined source now means one flag/note is the correct, simpler
+// behavior, not a regression — no news is fresh news, same as everywhere
 // else stale-cache warnings show up in this app.
 function renderStaleNotes(weather) {
-  const notes = [];
-  if (weather.forecastStale) {
-    notes.push('☁️ Cloud forecast is temporarily unavailable (DMI\'s forecast API is rate-limited right now) — showing the last cached reading.');
-  }
-  if (weather.obsStale) {
-    notes.push('🌡️ Temperature/wind reading is temporarily unavailable (DMI\'s observation API is rate-limited right now) — showing the last cached reading.');
-  }
-  return notes.map(n => `<div class="vd-stale-note">${n}</div>`).join('');
+  if (!weather.weatherStale) return '';
+  return '<div class="vd-stale-note">🌦️ Weather data is temporarily unavailable right now — showing the last cached reading.</div>';
 }
 
 // --- Opening hours (best-effort OSM `opening_hours` parser) ------------
@@ -1256,16 +1230,19 @@ function renderOpeningHours(raw) {
 function openVenueDetail(feature) {
   const p = feature.properties;
   const areaData = loadedAreas[p.areaId];
-  // Temp/wind/station stay area-wide; cloud cover/forecast time/staleness are
-  // this venue's own grid-cell reading (see fetchVenueForecasts), which can
-  // genuinely differ from the area's average shown in the top panel.
-  const areaWeather = areaData ? areaData.weather : {};
+  // Temperature, wind, and cloud cover are all this venue's own grid-cell
+  // reading now (see fetchVenueWeather) — Yr bundles all three into one
+  // per-cell response, unlike DMI's old split (temp/wind area-wide from a
+  // single station, cloud cover per-venue from a separate forecast call).
+  // Can genuinely differ from the area-wide average shown in the top panel.
   const weather = {
-    ...areaWeather,
-    observedTime: areaWeather.observedTime ? new Date(areaWeather.observedTime) : null,
+    temperature: p.temperature,
+    windSpeed: p.windSpeed,
+    windDir: p.windDir,
     cloudCover: p.cloudCover,
-    forecastTime: p.forecastTime ? new Date(p.forecastTime) : null,
-    forecastStale: p.forecastStale
+    symbolCode: p.symbolCode,
+    weatherTime: p.weatherTime ? new Date(p.weatherTime) : null,
+    weatherStale: p.weatherStale
   };
   const areaLabel = areaData ? areaData.area.label : '';
   const stateColor = STATE_COLORS[p.state] || '#4a5568';
@@ -1298,7 +1275,7 @@ function openVenueDetail(feature) {
     <div class="vd-state" style="background:${stateColor};color:${stateTextColor}">${STATE_LABELS[p.state]}</div>
 
     <div class="vd-section">
-      <h4>Weather in ${areaLabel}</h4>
+      <h4>Weather in ${areaLabel}${formatSymbolCode(weather.symbolCode) ? ` · ${formatSymbolCode(weather.symbolCode).icon} ${escapeHtml(formatSymbolCode(weather.symbolCode).label)}` : ''}</h4>
       <div class="vd-weather-row">
         <div class="vd-weather-item">
           <div class="val">${formatWeatherValue(weather.temperature, '°C', 1)}</div>
@@ -1313,9 +1290,7 @@ function openVenueDetail(feature) {
           <div class="label">Cloud</div>
         </div>
       </div>
-      ${weather.station ? `<div class="vd-station">Station: ${weather.station.name} (${weather.station.distanceKm.toFixed(1)} km away)</div>` : ''}
-      ${weather.observedTime ? `<div class="vd-station">Temp/wind observed at ${weather.observedTime.toLocaleTimeString('da-DK', { hour: '2-digit', minute: '2-digit' })}</div>` : ''}
-      ${weather.forecastTime ? `<div class="vd-station">Cloud forecast for ${weather.forecastTime.toLocaleTimeString('da-DK', { hour: '2-digit', minute: '2-digit' })}</div>` : ''}
+      ${weather.weatherTime ? `<div class="vd-station">Weather forecast for ${weather.weatherTime.toLocaleTimeString('da-DK', { hour: '2-digit', minute: '2-digit' })}</div>` : ''}
       ${renderStaleNotes(weather)}
       ${p.windSheltered ? `<div class="vd-wind-note">🛡️ A building appears to block the wind here — it may feel calmer than the reading above.</div>` : ''}
     </div>
@@ -1402,8 +1377,8 @@ function renderPanel() {
     return `
       <div class="panel-area">
         <p class="place">${area.label}</p>
-        <div class="meta">${sun.time.toLocaleTimeString('da-DK')} · Sun ${sun.altitudeDeg.toFixed(1)}° · Cloud forecast for area ${weather.cloudCover == null ? '—' : weather.cloudCover.toFixed(0) + '%'}${weather.forecastStale ? ' ⚠️' : ''}</div>
-        <div class="status">${sunAvailable ? 'Sun is out' : (sunIsUp ? 'Too cloudy' : 'Sun is down')}${weather.forecastStale ? ' · cached data' : ''}</div>
+        <div class="meta">${sun.time.toLocaleTimeString('da-DK')} · Sun ${sun.altitudeDeg.toFixed(1)}° · Cloud forecast for area ${weather.cloudCover == null ? '—' : weather.cloudCover.toFixed(0) + '%'}${weather.weatherStale ? ' ⚠️' : ''}</div>
+        <div class="status">${sunAvailable ? 'Sun is out' : (sunIsUp ? 'Too cloudy' : 'Sun is down')}${weather.weatherStale ? ' · cached data' : ''}</div>
       </div>`;
   }).join('');
 
@@ -1460,10 +1435,7 @@ async function loadArea(areaId) {
   }
 
   setLoadingText('Checking the sky over Copenhagen…');
-  const [stationWeather, forecastCells] = await Promise.all([
-    fetchStationWeather(center),
-    fetchVenueForecasts(venues)
-  ]);
+  const weatherCells = await fetchVenueWeather(venues);
   markStepDone('weather');
   const sun = getSunInfo(center[1], center[0]);
 
@@ -1473,12 +1445,24 @@ async function loadArea(areaId) {
 
   // Area-level summary (panel header, legend) averages across whichever grid
   // cells this area's venues actually span — with one venue or one cell in
-  // play that's just that cell's own reading, same as the old behavior.
-  const cellReadings = [...forecastCells.values()];
-  const cloudValues = cellReadings.map(r => r.cloudCover).filter(v => typeof v === 'number');
-  const avgCloudCover = cloudValues.length ? cloudValues.reduce((a, b) => a + b, 0) / cloudValues.length : null;
-  const forecastStale = cellReadings.some(r => r.stale);
-  const weather = { ...stationWeather, cloudCover: avgCloudCover, forecastStale };
+  // play that's just that cell's own reading. Temp/wind/cloud are all
+  // per-venue now (Yr's per-cell grid covers all three, unlike DMI's old
+  // single area-wide observation station), so this average is purely for
+  // the top panel's one-line area summary — a venue's own detail panel
+  // always shows its own cell's un-averaged reading.
+  const cellReadings = [...weatherCells.values()];
+  const mean = values => {
+    const nums = values.filter(v => typeof v === 'number');
+    return nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : null;
+  };
+  const weatherStale = cellReadings.some(r => r.stale);
+  const weather = {
+    temperature: mean(cellReadings.map(r => r.temperature)),
+    windSpeed: mean(cellReadings.map(r => r.windSpeed)),
+    windDir: circularMeanDegrees(cellReadings.map(r => r.windDir).filter(v => typeof v === 'number')),
+    cloudCover: mean(cellReadings.map(r => r.cloudCover)),
+    weatherStale
+  };
 
   for (const f of venues.features) {
     const cloudTier = cloudTierState(f.properties.cloudCover);
@@ -1492,8 +1476,11 @@ async function loadArea(areaId) {
     }
     f.properties.state = state;
     f.properties.areaId = areaId;
-    f.properties.windSheltered = weather.windDir != null
-      ? isVenueWindSheltered(f.geometry.coordinates, buildings, weather.windDir)
+    // Each venue's own wind direction now, not one area-wide reading — the
+    // same per-venue-accuracy upgrade cloud cover already got, made free by
+    // Yr bundling wind into the same per-cell response.
+    f.properties.windSheltered = f.properties.windDir != null
+      ? isVenueWindSheltered(f.geometry.coordinates, buildings, f.properties.windDir)
       : false;
   }
   markStepDone('shadows');

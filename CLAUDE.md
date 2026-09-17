@@ -6,11 +6,18 @@ Guidance for Claude Code when working in this repository.
 
 A static web app (`index.html` + `app.js`) that shows which cafés/bars/
 restaurants in selected Copenhagen areas are currently in sun or shade,
-combining live DMI cloud cover, computed sun position, and OSM building
-shadow geometry. Full details of the current implementation live in
-`readme.md` — read it first, and keep it in sync with any change you make
-(the app's own About tab renders it live, so it's user-facing, not just
-internal docs).
+combining live cloud cover from Yr (MET Norway), computed sun position,
+and OSM building shadow geometry. Full details of the current
+implementation live in `readme.md` — read it first, and keep it in sync
+with any change you make (the app's own About tab renders it live, so
+it's user-facing, not just internal docs).
+
+**This is the `api-yr` branch.** The original weather source was DMI;
+it was replaced here after a sustained real outage (DMI's forecast
+endpoint 429-ing/timing out for an evening, confirmed not fixable by a
+bigger retry budget) with MET Norway's Locationforecast API (the data
+behind yr.no) — see the "Why Yr, not DMI" bullet further down and
+readme.md's section of the same name for the full story.
 
 ## Running it
 
@@ -20,7 +27,7 @@ python3 server.py
 
 Never use plain `python3 -m http.server` — `server.py` is a stdlib-only
 Python server that both serves the static files *and* proxies/caches
-Overpass + DMI requests to disk under `data/`. Skipping it means every
+Overpass + Yr requests to disk under `data/`. Skipping it means every
 click hits the public APIs directly.
 
 To restart during development:
@@ -33,7 +40,7 @@ python3 server.py > /tmp/proxy_server.log 2>&1 &
 ## Architecture
 
 - `index.html` — structure + all CSS (no separate stylesheet).
-- `app.js` — everything: area config, Overpass/DMI fetch wrappers, sun/shadow
+- `app.js` — everything: area config, Overpass/Yr fetch wrappers, sun/shadow
   math, MapLibre rendering, the tabs/About-page/TOC logic, the Track tab's
   charts and log table.
 - `server.py` — static file server + caching proxy. No other backend.
@@ -52,23 +59,36 @@ No build step, no bundler, no npm — everything loads from CDNs
   which changes its cache key — so old cache files for that area become
   permanently orphaned (harmless, just dead weight in `data/`; safe to
   delete manually if it matters).
-- **Cache TTLs are intentionally split** in `server.py`, three-way, each
-  matched to how often that data source actually changes (confirmed
-  empirically, not guessed): Overpass data (venues/buildings) 25 days;
-  DMI **observation** data (temp/wind) 10 minutes — stations report on
-  the dot every 10 minutes, checked by comparing consecutive timestamps;
-  DMI **forecast** data (cloud cover) 60 minutes. The forecast number is
-  the one worth understanding, since it's counter-intuitive: HARMONIE
-  DINI only *recomputes* every 3 hours (00/03/06/09/12/15/18/21 UTC —
-  confirmed via DMI's own docs, correcting an earlier wrong assumption
-  in this file that it updates hourly), but each run publishes
-  hourly-resolution steps ~2.5 days out, and the app always picks the
-  step nearest "now" — a choice that only changes once an hour. So
-  polling more often than hourly buys zero freshness; it would just
-  re-fetch the same 3-hourly run's data against an endpoint that already
-  rate-limits more aggressively than the observation one (429s came fast
-  during testing at higher poll rates). Don't unify these three TTLs or
-  push the forecast one below ~60 minutes without re-verifying this.
+- **Why Yr, not DMI.** DMI's forecast endpoint spent an evening either
+  429-rate-limiting or timing out outright, confirmed directly (not
+  assumed) by querying it repeatedly outside the app — 6+ consecutive
+  failures, and critically, a *larger* retry budget still failed after
+  39s, proving it was a genuinely down/overloaded endpoint, not one
+  that just needed more patience (see the retry-budget bullet below).
+  Cross-checking DMI's own observation stations at the same moment also
+  showed real disagreement between nearby stations (75% cloud cover
+  coastal, 10% inland, same moment) — not conclusive alone, but combined
+  with the sustained outage, enough to switch. MET Norway's
+  Locationforecast API (api.met.no, the data behind yr.no) replaces it:
+  free, no API key, identified by `User-Agent` only, and a 20 req/s
+  Terms-of-Service rate limit — an order of magnitude more generous than
+  DMI's aggressive per-minute throttling. As a bonus (not the reason for
+  switching): Yr bundles temp/wind/cloud into **one** per-grid-cell
+  response, replacing DMI's split between a forecast grid (cloud cover)
+  and a hand-curated observation-station list (temp/wind) — see below.
+- **Weather cache TTL is dynamic, not fixed** — `read_cache_with_expiry`/
+  `write_cache_with_expiry` in `server.py` store Yr's own `Expires`
+  response header alongside the cached body (as one small JSON envelope,
+  not file-mtime-based like Overpass's cache) and check against that,
+  not a constant. This isn't just tidiness: Yr's Terms of Service
+  specifically ask clients to respect that header rather than poll on a
+  guessed schedule. `WEATHER_CACHE_TTL_SECONDS` (60 min) is only the
+  fallback used if the header is ever missing/unparseable. Overpass
+  data (venues/buildings) still uses the older fixed-TTL `read_cache`
+  (25 days — OSM edits are rare enough that "until you think it's
+  stale" is the right model, and Overpass doesn't send comparable
+  freshness metadata anyway) — don't conflate the two caching schemes
+  or try to unify them; they solve different problems.
 - **Never store a `Date` object in a venue feature's GeoJSON `properties`.**
   MapLibre round-trips feature properties through its internal tiling
   worker between `addSource` and a later click event, and a `Date` comes
@@ -80,7 +100,7 @@ No build step, no bundler, no npm — everything loads from CDNs
   detail popup completely, confirmed by clicking hundreds of venues in a
   real browser and seeing the same `toLocaleTimeString is not a function`
   error every time. Fixed by storing an ISO string in `properties`
-  (`fetchVenueForecasts` in `app.js`) and reconstructing the `Date` only
+  (`fetchVenueWeather` in `app.js`) and reconstructing the `Date` only
   at render time in `openVenueDetail`. Any other per-venue value that
   needs a non-JSON-safe type has the same trap.
 - **A venue with no successful cloud-cover reading must never default to
@@ -89,53 +109,31 @@ No build step, no bundler, no npm — everything loads from CDNs
   than falling through to `sun`. This was a real, confirmed bug: the
   old code had `if (cloudCover == null) return 'sun'` with a comment
   claiming it was safer to "assume clear rather than block the whole
-  area" — backwards, since DMI's forecast endpoint is the one that
-  rate-limits hardest, so a failed fetch silently painted venues as
-  sunny with no way to tell the reading was fake. Confirmed via a
-  Playwright test that intercepts `/api/forecast` and forces every
+  area" — backwards, since a failed weather fetch silently painted
+  venues as sunny with no way to tell the reading was fake. Confirmed
+  via a Playwright test that intercepts `/api/weather` and forces every
   request to fail: all affected venues correctly went pink instead of
   yellow. If you add another place that infers a UI state from
   `cloudCover`, check for `null` explicitly first, the same way
   `cloudTierState` does — don't assume a missing reading is safe to
   treat as any particular tier.
-- **Stale-cache fallback**: if a live Overpass/DMI fetch fails, the server
+- **Stale-cache fallback**: if a live Overpass/Yr fetch fails, the server
   serves whatever cache file exists for that exact key even if expired,
   rather than hard-erroring. Don't remove this without good reason — it's
-  what keeps the app usable when the public Overpass mirrors are flaky
-  (which happens often). The server marks these responses `X-Cache: STALE`
-  and the client checks that header (`forecastStale`/`obsStale`) to show a
-  visible warning in the venue panel and area panel — this was a real bug
-  found live: DMI's forecast endpoint was 429-rate-limited, silently
-  serving an **11-hour-old** cached reading with no indication, so a
-  venue's "Cloud forecast for 23:00" showed up at 10am with no way to
-  tell it wasn't current. Don't let a stale response render as if it
-  were fresh — always surface the `X-Cache` header when adding a new
-  weather/data display.
-  **`forecastStale` and `obsStale` are surfaced as two independent
-  warnings (`renderStaleNotes` in `app.js`), not one combined message.**
-  Cloud cover (`/api/forecast`) and temp/wind (`/api/weather`) are two
-  genuinely separate DMI calls that fail independently — DMI's forecast
-  endpoint rate-limits noticeably harder than the observation one, so
-  it's routine for only one of the two to be stale at a time. A user
-  explicitly asked for this after finding a single combined "DMI's data
-  is unavailable" note ambiguous — no way to tell which reading was
-  actually the cached one. Each note only renders when that specific
-  flag is true; if you add a third weather source, give it its own
-  independent stale check rather than folding it into an existing one.
-  **The venue panel shows each reading's own timestamp for the same
-  reason** — "Temp/wind observed at…" (from DMI observation's `observed`
-  property, via `fetchDmiParameter`'s `observed` field →
-  `fetchStationWeather`'s `observedTime`) sits right next to "Cloud
-  forecast for…", since a user asked for it after noticing the two
-  legitimately disagree (the station reports every 10 minutes; the
-  forecast picks the nearest hourly step) and wanted to see why rather
-  than just trust one combined-looking number. `observedTime` is kept as
-  an ISO string until render time in `openVenueDetail`, same as
-  `forecastTime` — see the "never store a Date in GeoJSON properties"
-  entry above for why that pattern exists, though `observedTime` itself
-  never touches a GeoJSON feature (it's area-wide, not per-venue), so
-  that specific bug doesn't apply to it — the ISO-string convention is
-  just kept consistent anyway.
+  what keeps the app usable when the public Overpass mirrors (or Yr) are
+  flaky. The server marks these responses `X-Cache: STALE` and the
+  client checks that header (`weatherStale`, one flag now — see below)
+  to show a visible warning in the venue panel and area panel. Don't let
+  a stale response render as if it were fresh — always surface the
+  `X-Cache` header when adding a new weather/data display.
+  **`weatherStale` is a single flag, not the two independent ones
+  (`forecastStale`/`obsStale`) this app used to have** — DMI split
+  cloud cover and temp/wind across two APIs that failed independently,
+  which needed two separate stale notes to say which reading was cached;
+  Yr bundles everything into one call, so one flag is the correct,
+  simpler behavior now, not a regression. `renderStaleNotes` in `app.js`
+  reflects this — if you ever add a second weather source again, give it
+  its own independent stale check rather than folding it into this one.
 - **Nothing loads on page open.** The map starts idle; data only fetches
   when the user toggles an area on. Don't reintroduce an eager fetch.
 - **Areas are multi-select, not radio buttons.** Multiple can be active
@@ -151,60 +149,53 @@ No build step, no bundler, no npm — everything loads from CDNs
   `load` event (or immediately if `map.isStyleLoaded()`); await it right
   before the layer calls, not at the top of `loadArea`, so it doesn't
   serialize with the data fetch.
-- **Weather is per-area, not per-venue**, and deliberately uses a fixed
-  list of DMI stations (`WEATHER_STATIONS` in `app.js`) picked by hand,
-  not a bbox search. Copenhagen's inner-city stations each report only a
-  subset of parameters (e.g. Landbohøjskolen has temperature but no
-  wind/cloud); the ones with the full set (temp+wind+cloud together)
-  sit on the outskirts (Kastrup, Jægersborg, etc.). The app picks the
-  nearest station *from that curated list* per area, not the nearest
-  station overall — don't replace this with a live station-search query
-  without re-checking which stations actually carry every parameter.
-- **Cloud cover and temp/wind come from two different DMI APIs on
-  purpose.** Cloud cover (`fetchForecastCloudCover` in `app.js`, backed
-  by `/api/forecast` → `fetch_dmi_forecast_cloud_cover` in `server.py`)
-  uses the **forecast** model (`harmonie_dini_sf`) at a 2km grid. Temp/wind
-  (`fetchDmiParameter`) still come from the nearest observation station,
-  since those don't need the same spatial granularity and observation
-  data is a real measurement rather than a model's nearest-hour value.
-  Don't switch temp/wind to the forecast source without a reason — it'd
-  add rate-limit risk for no benefit.
-- **Cloud cover is read per-venue, not per-area-center.** It used to be
-  one fetch at the area's center coordinate applied to every venue in
-  that area — wrong for a venue near an area's edge, which can sit in a
-  genuinely different 2km grid cell than its own area's center (e.g. an
-  Østerbro café close to the Nordhavn border). Now `fetchVenueForecasts`
-  (`app.js`) groups venues by which grid cell they fall in
-  (`forecastGridCell`, step sizes `FORECAST_GRID_LAT_STEP`/
-  `FORECAST_GRID_LON_STEP`) and fetches once per distinct cell, not once
-  per venue — confirmed live: Nørrebro's 286 venues spanned only 4
-  distinct cells, so it's 4 `/api/forecast` calls, not 286. The server
-  independently re-snaps to the same grid (`snap_to_forecast_grid` in
-  `server.py`) before building the cache key, so cells line up for
-  caching even if a client ever computed them slightly differently, and
-  a per-cell lock (`_forecast_lock_for`) coalesces concurrent requests
-  for the same cell so a whole area loading at once can't fire duplicate
-  upstream DMI calls for it. **The grid step constants are duplicated
-  between `app.js` and `server.py` — there's no shared config file, so
-  if you change one, change the other.** The area panel's single
-  "Cloud X%" figure is now an average across the area's distinct cells
-  (`avgCloudCover` in `loadArea`); a venue's own detail panel shows its
-  own cell's reading, which can legitimately differ from that average.
-- **`fetch_dmi_forecast_cloud_cover`'s retry budget (`server.py`) is
-  deliberately tight — `retries=2`, 2s/4s backoff, worst case ~6s.** It
-  used to be `retries=4` with a 3/6/9/12s backoff (worst case ~30s),
-  tuned back when only one forecast call happened per area load. Since
-  the per-venue grid-tiling change above, an area load fires one call
-  per distinct grid cell *in parallel*, so when DMI is genuinely
-  rate-limiting, every one of those parallel calls pays the same
-  worst-case tax independently and the user is stuck on the loading
-  overlay for as long as the *slowest* one takes — confirmed live at
-  over 60s (once even 150s) during a real DMI 429 spell, which is
-  exactly what read as "an error on the map" even though nothing had
-  actually crashed. Don't raise this back up without re-checking that
-  math — the stale-cache fallback is already a good answer within its
-  60-minute TTL, so failing into it fast matters more than marginally
-  fresher data bought with a much longer hang.
+- **Weather is per-venue now, not per-area** — a side effect of moving
+  to Yr, not extra work: DMI needed a hand-curated station list
+  (`WEATHER_STATIONS`, since removed) because Copenhagen's inner-city
+  observation stations each only reported a subset of parameters, so
+  temp/wind were area-wide (one station's reading shared by every venue
+  in that area) while only cloud cover was per-venue. Yr's
+  Locationforecast API has no comparable "station" concept — every grid
+  cell carries temp/wind/cloud together — so `fetchVenueWeather` in
+  `app.js` just assigns all three (plus `symbolCode`) to every venue from
+  its own cell's reading. The area panel's summary figures are still an
+  average across the area's distinct cells (temp/wind-speed/cloud via
+  plain mean, wind direction via `circularMeanDegrees` — a plain average
+  of e.g. 350° and 10° gives 180°, due south, not the correct ~0°) purely
+  for that one-line display; a venue's own detail panel always shows its
+  own cell's un-averaged reading.
+- **Cloud cover is read per-venue, not per-area-center.** One fetch at
+  the area's center coordinate applied to every venue would be wrong for
+  a venue near an area's edge, which can sit in a genuinely different
+  ~2km grid cell than its own area's center (e.g. an Østerbro café close
+  to the Nordhavn border) — sharing one area-wide reading gives edge
+  venues the wrong number. `fetchVenueWeather` (`app.js`) groups venues
+  by which grid cell they fall in (`weatherGridCell`, step sizes
+  `WEATHER_GRID_LAT_STEP`/`WEATHER_GRID_LON_STEP`) and fetches once per
+  distinct cell, not once per venue — confirmed live: Nørrebro's 286
+  venues spanned only 4 distinct cells, so it's 4 `/api/weather` calls,
+  not 286. The server independently re-snaps to the same grid
+  (`snap_to_weather_grid` in `server.py`) before building the cache key,
+  so cells line up for caching even if a client ever computed them
+  slightly differently, and a per-cell lock (`_weather_lock_for`)
+  coalesces concurrent requests for the same cell so a whole area
+  loading at once can't fire duplicate upstream Yr calls for it. **The
+  grid step constants are duplicated between `app.js` and `server.py` —
+  there's no shared config file, so if you change one, change the
+  other.** (This grid-snapping pattern predates Yr — it was originally
+  built for DMI's forecast grid and carried over unchanged, since it's
+  upstream-agnostic: any per-cell weather API benefits the same way.)
+- **`fetch_yr_weather`'s retry budget (`server.py`) is deliberately
+  tight — `retries=2`, 2s/4s backoff, worst case ~6s** — not because Yr
+  is known to be flaky (the opposite, so far), but because of a hard
+  lesson from DMI: **no retry budget fixes a genuinely-down upstream, it
+  only makes failures take longer.** Confirmed live while investigating
+  the DMI outage that prompted this branch — raising the budget (to
+  `retries=3`, 3/6/9s backoff) didn't help; the same request still
+  failed after 39s instead of a lower number, since the endpoint was
+  actually down, not momentarily busy. Small-and-cheap is the correct
+  default; only raise it with live evidence a bigger budget actually
+  recovers something, not on the assumption that it might.
 - **The UI theme (dark by default, light "day" theme while the sun's up in
   Copenhagen) is driven by `computeTheme()`/`switchTheme()` in `app.js`,
   toggling `document.documentElement.dataset.theme` and swapping the
@@ -257,16 +248,15 @@ No build step, no bundler, no npm — everything loads from CDNs
   Don't bind to `localhost` again without re-adding an explicit opt-in
   for LAN access, and don't add a new `/api/*` route without the same
   hardening pattern: per-IP rate limiting (`api_rate_limited()`/
-  `static_rate_limited()`), a body-size cap on `/api/overpass`, an
-  allowlist for `parameterId` in `/api/weather`, and bounds-checked
-  `lat`/`lon` in `/api/forecast`.
+  `static_rate_limited()`), a body-size cap on `/api/overpass`, and
+  bounds-checked `lat`/`lon` in `/api/weather`.
 - **Static file serving is an allowlist (`PUBLIC_PATHS`), not a
   blocklist — do not change this back.** This was a real, confirmed,
   serious vulnerability, not a theoretical one: before this fix,
   `server.py` served the *entire* project directory via
   `SimpleHTTPRequestHandler`'s default behavior, meaning
   `GET /data/` returned a live directory listing of every cached
-  Overpass/DMI response plus the full, unbounded `api_log.jsonl` (bypassing
+  Overpass/Yr response plus the full, unbounded `api_log.jsonl` (bypassing
   `/api/logs`' own size cap entirely), `GET /server.py` returned the
   complete backend source, and `GET /.git/config` / `.git/HEAD` /
   `.git/logs/HEAD` all returned 200 — the whole git history was
@@ -280,13 +270,13 @@ No build step, no bundler, no npm — everything loads from CDNs
   reopens the `data/`-style listing risk for whatever else ends up in
   that directory later).
 - **Rate limiting is two separate budgets, not one shared one, and both
-  are 120/min** — `api_rate_limited` protects the Overpass/DMI proxies
+  are 120/min** — `api_rate_limited` protects the Overpass/Yr proxies
   specifically; `static_rate_limited` protects the server itself (static
   files and `/api/logs`, neither of which costs an upstream call). They
   used to be one shared 30/min bucket covering everything, which broke
   real usage: a single area load fans out into an Overpass call plus
-  several per-tile forecast calls plus a few observation calls, and once
-  static file requests started sharing that same budget, a normal
+  several per-tile weather calls, and once static file requests started
+  sharing that same budget, a normal
   single-session flow (load the page, pick an area, open the About tab)
   could exhaust it before `readme.md` even fetched — confirmed live, not
   theoretical. Splitting the budgets wasn't enough on its own, either:
@@ -308,16 +298,20 @@ No build step, no bundler, no npm — everything loads from CDNs
   that's what broke this twice.
 
 - **The "Track" tab (third header tab, alongside Map/About) visualizes every
-  proxied API call** — Overpass venues/buildings per area, DMI forecast per
-  grid tile, DMI observation per station — as hourly/daily stacked-bar charts
-  plus a raw log table, so cache effectiveness (or accidental API spamming)
-  is visible rather than only inferable from server console output.
-  `server.py`'s `log_api_call()` appends one JSON line per request (cache
-  status included — `HIT`/`MISS`/`STALE`/`ERROR`) to `data/api_log.jsonl` at
-  every response branch of `/api/overpass`, `/api/forecast`, and
-  `/api/weather` — **if you add a new branch to any of those three routes
-  (a new error path, a new cache outcome), log it too, or that branch
-  becomes invisible to the Track tab.** The log is trimmed to the last
+  proxied API call** — Overpass venues/buildings per area, Yr weather per
+  grid tile — as hourly/daily stacked-bar charts plus a raw log table, so
+  cache effectiveness (or accidental API spamming) is visible rather than
+  only inferable from server console output. Only two chart cards now, not
+  three — DMI's old split between a forecast-per-tile call and an
+  observation-per-station call collapsed into one Yr call per grid cell
+  when this branch replaced it, so there's one weather chart instead of
+  two; don't re-add a third card without a real second weather-call kind
+  to justify it. `server.py`'s `log_api_call()` appends one JSON line per
+  request (cache status included — `HIT`/`MISS`/`STALE`/`ERROR`) to
+  `data/api_log.jsonl` at every response branch of `/api/overpass` and
+  `/api/weather` — **if you add a new branch to either route (a new error
+  path, a new cache outcome), log it too, or that branch becomes
+  invisible to the Track tab.** The log is trimmed to the last
   `LOG_TRIM_KEEP_LINES` (10,000) once it exceeds `MAX_LOG_BYTES` (5MB), so it
   won't grow unbounded on a long-running server. `GET /api/logs` serves the
   raw entries (capped, rate-limited like the other routes) to

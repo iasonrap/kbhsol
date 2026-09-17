@@ -5,6 +5,11 @@ are sitting in sun vs. shade — based on live cloud cover, real sun
 position, and actual building shadows. Pick one or more areas and only
 those load; nothing loads until you choose.
 
+> **`api-yr` branch**: this branch replaces DMI, this app's original
+> weather source, with [MET Norway's Locationforecast API](https://api.met.no/weatherapi/locationforecast/2.0/documentation)
+> (the data behind [yr.no](https://www.yr.no/)) — see "Why Yr, not DMI"
+> below for what prompted the switch.
+
 ## How it works
 
 - **Venues & buildings** — fetched from the [Overpass API](https://overpass-api.de)
@@ -13,68 +18,64 @@ those load; nothing loads until you choose.
   `building:levels` tag, default 9m if untagged), inside the bounding
   box of whichever area(s) you've selected.
 - **Local caching proxy (`server.py`)** — the browser never calls
-  Overpass or DMI directly. A small Python server (stdlib only) sits in
+  Overpass or Yr directly. A small Python server (stdlib only) sits in
   front, proxies those requests, and caches each response to disk under
   `data/`. Toggling areas on and off repeatedly reuses the cached file
   instead of re-hitting the public APIs — useful since those are shared,
-  rate-limited services. Each cache TTL is set to match how often that
-  data source *actually* changes, confirmed empirically rather than
-  guessed, so nothing is over- or under-cached:
+  rate-limited services.
   - **Venue/building data (Overpass) — 25 days.** OSM edits to a café's
     tags or a building's footprint are rare enough that this is
-    effectively "until you think it's stale."
-  - **Observation weather (temp/wind) — 10 minutes.** DMI's stations
-    report a new reading exactly every 10 minutes (confirmed by checking
-    consecutive timestamps: `:X0`, `:X0+10`, `:X0+20`...) — caching
-    longer just serves staler data for no reason.
-  - **Forecast weather (cloud cover) — 60 minutes.** This one's less
-    obvious: DMI's HARMONIE DINI model only *recomputes* every 3 hours
-    (00/03/06/09/12/15/18/21 UTC), but each run publishes hourly-resolution
-    forecast steps for the following ~2.5 days. The app always picks the
-    step nearest to "now," and that choice only changes once an hour —
-    so there's no freshness gained by polling more often than hourly; it
-    would just re-fetch the same 3-hourly run's data against an endpoint
-    that already rate-limits more aggressively than the observation one.
+    effectively "until you think it's stale," confirmed empirically
+    rather than guessed.
+  - **Weather (Yr) — however long Yr's own `Expires` response header
+    says**, not a fixed TTL. Yr's Terms of Service specifically ask
+    clients to cache responses and respect that header rather than
+    poll on a fixed schedule, and it's more correct anyway — they
+    shorten it themselves around a forecast model run's update. In
+    practice this has been observed around 30-60 minutes; a fixed
+    60-minute fallback applies only if that header is ever missing.
 - **Sun position** — computed locally with [SunCalc](https://github.com/mourner/suncalc)
   (altitude + azimuth for the current time and location). No API needed.
-- **Weather** — from [DMI Open Data](https://opendataapi.dmi.dk), split
-  across two sources:
+- **Weather** — from [MET Norway's Locationforecast API](https://api.met.no/weatherapi/locationforecast/2.0/documentation),
+  one call per grid cell covering everything at once:
   - **Cloud cover** (drives the sun/shade classification, bucketed into
     four tiers: sunny <10%, partly sunny 10–30%, partly cloudy 30–60%,
-    cloudy 60%+) comes from DMI's **forecast** model (HARMONIE DINI,
-    2km grid), read at the nearest hour to now, queried per *venue* (at
-    the ~2km grid cell each venue falls in, not the area's center) —
-    this was a deliberate switch from observation stations — Copenhagen
-    only has ~2 stations covering all ten areas, so every area showed
-    identical weather; the 2km forecast grid gives genuinely different
-    values area-to-area (confirmed empirically: two areas ~2km apart
-    showed 18% vs 81% cloud cover at the same moment). Querying per
-    venue rather than per area center matters at an area's edges — a
-    café near the boundary between two neighborhoods can sit in a
-    different grid cell than its own area's center, so sharing one
-    area-wide reading was giving edge venues the wrong number. Venues
-    are grouped by grid cell before fetching, so this is one request per
-    distinct cell actually in play, not one per venue (confirmed: a
-    286-venue area spanned only 4 cells).
-  - **Temperature, wind speed/direction** (shown in a venue's detail
-    panel, don't affect the classification) still come from the nearest
-    real **observation** station, picked from a curated list of stations
-    known to report all three together (see "Weather is per-area, not
-    per-venue" further down).
-  - No API key required for either — DMI's endpoints are open, subject
-    only to fair-use rate limiting. The forecast endpoint enforces a
-    noticeably stricter limit than the observation one; caching it at
-    15 minutes (fresher than the model's own ~hourly update cadence) is
-    a deliberate tradeoff of more current-feeling data against a higher
-    chance of hitting that limit under heavy use (see "Why cloud cover,
-    not solar radiation" below for the classification logic itself).
-- **Wind shelter** — a venue's wind reading is area-wide (see above), but
-  each venue is individually checked for whether a nearby building stands
-  directly upwind within ~40m — if so, its detail panel notes that the
-  wind may feel calmer there than the reading suggests. Uses the same
-  ray-casting approach as the sun shadow check, just without the
-  altitude trigonometry (wind shelter is a proximity/height question,
-  not an angle-above-horizon one).
+    cloudy 60%+ — the same thresholds this app has always used, carried
+    over unchanged since this is a like-for-like "% of sky covered"
+    parameter swap, not a new metric) — read at the nearest forecast
+    timestep to now, queried per *venue* (at the ~2km grid cell each
+    venue falls in, not the area's center), since a café near the
+    boundary between two neighborhoods can sit in a different grid cell
+    than its own area's center — sharing one area-wide reading was
+    giving edge venues the wrong number. Venues are grouped by grid cell
+    before fetching, so this is one request per distinct cell actually
+    in play, not one per venue (confirmed: a 286-venue area spanned only
+    4 cells).
+  - **Temperature, wind speed/direction** are per-venue too now, not
+    area-wide — a side effect of Yr bundling all three into one per-cell
+    response rather than something extra that had to be built. Wind
+    direction's *area-wide* summary figure (shown in the top-left panel)
+    uses a proper circular mean across the area's distinct cells, not a
+    naive average — averaging e.g. 350° and 10° arithmetically gives
+    180° (due south, the opposite of correct) instead of 0° (due north,
+    the right answer).
+  - Also included: Yr's own `symbol_code` (e.g. `partlycloudy_day`,
+    `clearsky_day`) — MET Norway's own "how sunny does this actually
+    look" classification, shown as a bonus label next to the numeric
+    weather tiles. Not used to drive the sun/shade tiering itself (cloud
+    cover still does that, so the four-tier logic above stays simple and
+    unchanged) — just a nice human-readable read, tuned by actual
+    forecasters, shown alongside the numbers.
+  - No API key required — Yr's endpoint is open, identified purely by a
+    descriptive `User-Agent` header (no query-string key, unlike some
+    APIs), subject to a generous 20 requests/second per app under their
+    Terms of Service.
+- **Wind shelter** — each venue is individually checked for whether a
+  nearby building stands directly upwind within ~40m of its own wind
+  reading — if so, its detail panel notes that the wind may feel calmer
+  there than the reading suggests. Uses the same ray-casting approach as
+  the sun shadow check, just without the altitude trigonometry (wind
+  shelter is a proximity/height question, not an angle-above-horizon one).
 - **Shadow calculation** — for each venue, a ray is cast from its
   location toward the sun's compass bearing (using [Turf.js](https://turfjs.org)).
   If that ray hits a building whose height is enough to block the sun
@@ -87,26 +88,40 @@ those load; nothing loads until you choose.
   its type: cup (café), wine glass (bar/pub), fork & knife (restaurant)
   — drawn on the fly with canvas, no icon files needed.
 
-**Why cloud cover, not solar radiation.** DMI also exposes measured solar
-radiation (`radia_glob`), which sounds like a more direct "is the sun
-out" signal — but it conflates two things: how covered the sky is, and
-how high the sun is (which swings hugely by time of day/season). A clear
-sky at 8am reads similarly to an overcast noon. Cloud cover is roughly
-time-of-day-independent, and the app already computes sun altitude
-separately (for the shadow math), so combining the two — rather than
-using one blended radiation number — keeps each signal doing one job.
+**Why Yr, not DMI.** This app's original weather source was DMI (Danish
+Meteorological Institute) — a natural first choice for Danish data, and
+it worked well for months. It was dropped after a real, sustained
+incident: DMI's forecast endpoint spent an evening either 429-rate-limiting
+or timing out outright, confirmed directly (not assumed) by querying it
+repeatedly outside the app and watching it fail 6+ times in a row across
+different retry budgets — including a *larger* retry budget, which still
+failed after 39 seconds, proving the problem wasn't "needs more patience"
+but a genuinely down/overloaded endpoint. Cross-checking DMI's own
+observation stations at the same moment showed real disagreement between
+nearby stations too (75% cloud cover at a coastal station, 10% at an
+inland one, at the same moment) — not conclusive on its own, but combined
+with the sustained forecast outage, enough to look elsewhere. MET
+Norway's API (the data behind yr.no) replaces it: same free/no-key
+access, a rate limit an order of magnitude more generous (20 req/s vs.
+DMI's aggressive per-minute throttling), and — as a bonus, not the
+reason for switching — one unified per-cell response instead of DMI's
+split between a forecast grid (cloud cover) and a curated list of
+observation stations (temp/wind), so temperature and wind became
+per-venue for free instead of extra work.
 
-Every data source here (OpenStreetMap/Overpass, DMI Open Data, MapLibre GL,
+Every data source here (OpenStreetMap/Overpass, MET Norway/Yr, MapLibre GL,
 OpenFreeMap, Turf.js, SunCalc) is free and open, with no API keys or
-billing required.
+billing required. Yr's data is CC BY 4.0 — used here under that license,
+credited to the Norwegian Meteorological Institute and NRK.
 
 This app genuinely couldn't exist without the open-source and open-data
 community: free building footprints and venue data from OpenStreetMap's
-volunteer mappers, a free public weather API from DMI, and free open-source
-mapping tools maintained by people who chose to give this away. Small,
-personal projects like this one are only possible because that infrastructure
-exists and is freely shared — it's worth appreciating, and supporting where
-you can (OpenStreetMap in particular runs on volunteer contributions).
+volunteer mappers, a free public weather API from MET Norway, and free
+open-source mapping tools maintained by people who chose to give this
+away. Small, personal projects like this one are only possible because
+that infrastructure exists and is freely shared — it's worth
+appreciating, and supporting where you can (OpenStreetMap in particular
+runs on volunteer contributions).
 
 ## Running it
 
@@ -115,7 +130,7 @@ python3 server.py
 ```
 
 Then open **http://localhost:8123** in a browser. `server.py` both serves
-the static files and proxies/caches the Overpass and DMI requests — don't
+the static files and proxies/caches the Overpass and Yr requests — don't
 use plain `python3 -m http.server` any more, since that skips the caching
 layer entirely.
 
@@ -139,15 +154,15 @@ your laptop to use the app there too, no extra setup needed.
   length at that width — with the same table of contents as a horizontal
   row of tappable pill chips underneath the header, still tracking which
   section you're reading as you scroll.
-- **Track** shows every API call this server has made to Overpass and DMI,
+- **Track** shows every API call this server has made to Overpass and Yr,
   and whether the local cache absorbed it — a stat row (total requests,
-  cache hits, real upstream calls, hit rate, errors), then three charts
-  (venues & buildings per area, cloud forecast per grid tile, weather
-  observations per station) as hourly-last-24h or daily-last-14-days
-  stacked bars, and a raw log table underneath. It exists to make the
-  caching design's effectiveness visible rather than something you have
-  to take on faith from server console output — if a bug ever starts
-  hammering an upstream API, this is where it'd show up as a spike.
+  cache hits, real upstream calls, hit rate, errors), then two charts
+  (venues & buildings per area, weather per grid tile) as hourly-last-24h
+  or daily-last-14-days stacked bars, and a raw log table underneath. It
+  exists to make the caching design's effectiveness visible rather than
+  something you have to take on faith from server console output — if a
+  bug ever starts hammering an upstream API, this is where it'd show up
+  as a spike.
 - Below the header is the area bar. On open, the map shows a wide view
   of Copenhagen and loads nothing — pick one or more of ten
   neighborhoods (Vesterbro, Frederiksberg, Nordvest, Bispebjerg,
@@ -177,14 +192,15 @@ your laptop to use the app there too, no extra setup needed.
   the cloud reading:
   - 🌙 **dark blue** — sun is down (night)
   - 🏢 **dark grey** — a building is blocking the sun right now
-  - 🟡 **yellow** — sunny (DMI cloud cover under 10%)
+  - 🟡 **yellow** — sunny (cloud cover under 10%)
   - 🟠 **pale gold** — partly sunny (10–30% cloud cover)
   - ⚪ **light grey** — partly cloudy (30–60% cloud cover)
   - ⚫ **mid grey** — cloudy (60%+ cloud cover)
-  - 💗 **pink** — no forecast available for that venue right now (DMI's
-    forecast endpoint failed for its grid cell, most often rate-limiting)
-    — shown as "N/A" rather than guessed at, since assuming clear skies
-    when the reading is simply missing would be actively misleading
+  - 💗 **pink** — no weather data available for that venue right now (Yr's
+    endpoint failed for its grid cell, and there was no cached reading to
+    fall back to either) — shown as "N/A" rather than guessed at, since
+    assuming clear skies when the reading is simply missing would be
+    actively misleading
 - Each dot also shows a small icon for its type: a cup (café), a wine
   glass (bar/pub), or a fork & knife (restaurant).
 - Hover over a dot for a quick popup with its name, type, and current
@@ -197,22 +213,16 @@ your laptop to use the app there too, no extra setup needed.
     like it, opening `google.com/maps/dir` or `maps.apple.com` with the
     venue's coordinates in a new tab, which the OS then hands off to
     whichever app (or its web fallback) is installed.
-  - **Weather in [area]** — temperature and wind speed/direction come
-    from the nearest DMI observation station, shared by every venue in
-    the area (different *areas* do get different stations, e.g. Nordvest
-    nearest to Jægersborg, Christiania nearest to Kastrup, since the
-    city's inner stations each only report a partial set of parameters
-    and the fully-equipped ones sit on the outskirts). The panel shows
-    exactly when that reading was taken ("Temp/wind observed at…") right
-    alongside the cloud forecast's own timestamp, since the two come from
-    different DMI APIs that update on different schedules — the station
-    reports every 10 minutes, the forecast picks the nearest hourly step
-    — so they're rarely the same moment. Cloud cover,
-    though, *is* per-venue — it's this specific venue's own forecast
-    grid-cell reading, which can differ from the area-wide average shown
-    in the top-left panel if the venue sits near the edge of its area.
-    If a building stands directly upwind of that specific venue, a note
-    below the weather tiles says so — also per-venue.
+  - **Weather in [area]** — temperature, wind speed/direction, and cloud
+    cover are all this specific venue's own forecast grid-cell reading
+    (Yr bundles all three into one per-cell response), shown alongside
+    Yr's own plain-language read of the sky (e.g. "☀️ Clear sky," "⛅
+    Partly cloudy") next to the section heading. Any of the three can
+    differ from the area-wide average shown in the top-left panel if the
+    venue sits near the edge of its area. The panel shows exactly when
+    that reading was taken ("Weather forecast for…"). If a building
+    stands directly upwind of that specific venue's own wind reading, a
+    note below the weather tiles says so — also per-venue.
   - **Venue info** — whatever OpenStreetMap has tagged for that place.
     Opening hours get parsed into a weekly table, reordered to start from
     today and highlight it. OSM's `opening_hours` syntax is notoriously
@@ -243,16 +253,12 @@ your laptop to use the app there too, no extra setup needed.
 - If OpenStreetMap's Overpass API is temporarily down, you'll see a
   "Could not load map data" message with a retry button instead of a
   silent hang.
-- If DMI's weather API is temporarily rate-limited, the app falls back to
+- If Yr's weather API is temporarily unavailable, the app falls back to
   the last cached reading rather than erroring — but it tells you: a
   small ⚠️ appears next to the cloud % in the area panel, and the venue
   detail panel shows an amber note, so a mismatch (like a forecast
-  timestamped hours away from the current time) is never silently
-  confusing. Cloud cover and temperature/wind are two separate DMI calls
-  that fail independently — DMI's forecast API rate-limits noticeably
-  harder than its observation one — so each gets its own note (☁️ for
-  cloud, 🌡️ for temp/wind) naming which specific reading is the cached
-  one, rather than one combined "something's stale" message.
+  timestamped noticeably away from the current time) is never silently
+  confusing.
 
 ## Known limitations
 
@@ -264,7 +270,7 @@ your laptop to use the app there too, no extra setup needed.
 - Venue and building data are fetched live from Overpass through the
   local caching proxy rather than saved into static `.geojson` files, so
   the app still depends on Overpass being reachable the first time an
-  area is loaded (or once every 20 minutes after that).
+  area is loaded (or after the cache expires).
 
 ## Security notes
 
@@ -280,7 +286,7 @@ your laptop to use the app there too, no extra setup needed.
   pre-production review: `server.py` was serving the *entire* project
   folder over plain HTTP via `SimpleHTTPRequestHandler`'s default
   behavior. Confirmed live with `curl` (not theoretical) — `GET /data/`
-  returned a directory listing of every cached Overpass/DMI response plus
+  returned a directory listing of every cached Overpass/Yr response plus
   the complete, unbounded API request log (bypassing the Track tab's own
   endpoint entirely), `GET /server.py` returned the full backend source,
   and `GET /.git/config` (and `.git/HEAD`, `.git/logs/HEAD`) all returned
@@ -297,26 +303,24 @@ your laptop to use the app there too, no extra setup needed.
   before that work landed — it is now, on a trusted home network. It's
   still only as safe as the network it's on, though: anyone else on that
   same Wi-Fi (a coffee shop, a shared office network) can also reach it,
-  not just you. `/api/overpass`, `/api/weather`, and `/api/forecast` are
-  unauthenticated proxies to third-party APIs, so they're hardened
-  against being used as an open relay — per-IP rate
-  limiting, a body-size cap on Overpass queries, an allowlist for
-  `parameterId`, and bounds-checked `lat`/`lon`. Rate limiting is two
-  separate budgets: 120 requests/minute for the routes that cost a real
-  Overpass/DMI call, and the same 120/minute for static files and
+  not just you. `/api/overpass` and `/api/weather` are unauthenticated
+  proxies to third-party APIs, so they're hardened against being used as
+  an open relay — per-IP rate limiting, a body-size cap on Overpass
+  queries, and bounds-checked `lat`/`lon`. Rate limiting is two separate
+  budgets: 120 requests/minute for the routes that cost a real
+  Overpass/Yr call, and the same 120/minute for static files and
   `/api/logs` (which never leave this server) — otherwise a single normal
-  area load's fan-out of Overpass/forecast/observation calls could exhaust
-  a shared budget and start blocking your own next page load, which is
-  exactly what happened during testing before they were split. The
-  Overpass/DMI budget started at 30/min and had to be raised — one area
-  load alone costs roughly 7-10 of those requests (Overpass venues +
-  buildings, a few observation calls, several forecast tiles), and
-  loading multiple areas back to back is a normal way to use the
-  multi-select area picker, not abuse; 30/min meant loading 3-4 areas in
-  quick succession could exhaust it, and every area after that failed
-  with a misleading "Overpass API may be busy" — misleading because the
-  429 was this server's own limiter, not Overpass. Both a real bug found
-  live, not in review.
+  area load's fan-out of Overpass/weather calls could exhaust a shared
+  budget and start blocking your own next page load, which is exactly
+  what happened during testing before they were split. The Overpass/Yr
+  budget started at 30/min and had to be raised — one area load alone
+  costs several of these (Overpass venues + buildings, a handful of
+  weather tiles), and loading multiple areas back to back is a normal
+  way to use the multi-select area picker, not abuse; 30/min meant
+  loading 3-4 areas in quick succession could exhaust it, and every area
+  after that failed with a misleading "Overpass API may be busy" —
+  misleading because the 429 was this server's own limiter, not
+  Overpass. Both a real bug found live, not in review.
   `ThreadingHTTPServer` is used instead of plain `HTTPServer` so one slow
   client can't block every other request. None of this is a substitute
   for real auth if this ever needs to be more than a personal tool on the

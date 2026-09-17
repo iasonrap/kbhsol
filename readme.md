@@ -420,3 +420,12 @@ your laptop to use the app there too, no extra setup needed.
   open internet — and none of it includes TLS, which a reverse proxy in
   front of this server would need to provide for any deployment beyond
   localhost.
+
+## License
+
+[PolyForm Strict License 1.0.0](LICENSE) — you're welcome to read the
+code, but reuse, modification, and redistribution aren't licensed. This
+covers the app's own code only; it has no bearing on the separately
+licensed third-party data (OpenStreetMap/ODbL, MET Norway/CC BY 4.0, DMI
+open data) and libraries (MapLibre GL, Turf.js, SunCalc, marked.js) it
+uses — see "How it works" above for those credits.

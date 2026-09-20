@@ -111,7 +111,7 @@ RADAR_CACHE_TTL_SECONDS = 5 * 60
 # the project directory (server.py, CLAUDE.md, .git/, data/, .gitignore) must
 # stay unreachable — see the do_GET allowlist check for why this is an
 # allowlist and not a blocklist.
-PUBLIC_PATHS = {'/', '/index.html', '/app.js', '/readme.md'}
+PUBLIC_PATHS = {'/', '/index.html', '/app.js', '/readme.md', '/exeo.png'}
 
 # --- Hardening for running this publicly, not just on localhost --------
 #

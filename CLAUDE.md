@@ -44,6 +44,30 @@ lsof -ti:8123 -sTCP:LISTEN | xargs -r kill; sleep 1
 python3 server.py > /tmp/proxy_server.log 2>&1 &
 ```
 
+## Working in this repo (for agents)
+
+- **Syntax checks, not a test suite.** There is no test suite and no linter.
+  Run `python3 -m py_compile server.py` and `node --check app.js` after edits.
+- **Verify UI changes in a real browser.** Use Playwright (Chromium) against
+  `http://localhost:8123`: load an area, take a screenshot, and check for
+  `pageerror` events. See "Testing changes" at the end of this file.
+- **Set the browser clock to daytime for shadow work.** Copenhagen is dark for
+  much of the day in autumn and winter, and with the sun down the shadow code
+  never runs. Use `page.clock.set_fixed_time("2026-10-08T11:30:00Z")` before
+  `goto`, and check `getSunInfo(...).altitudeDeg > 0` in the page.
+- **Check optimisations numerically, not by reading.** Compare the old and new
+  functions on the same inputs, using `git show HEAD:<file>` in a scratch
+  directory, and count mismatches. Radar and shadow changes both had to pass this.
+- **Keep the duplicated constants in sync.** `WEATHER_GRID_*_STEP` (server.py and
+  app.js) and `RADAR_NOWCAST_OFFSETS_MINUTES` / `TIMELINE_OFFSETS_MINUTES` (same
+  pair). Bump `WEATHER_SCHEMA_VERSION` when the Yr response shape changes.
+- **Comments say why, not what happened.** Long bug narratives belong here in
+  CLAUDE.md, not in the code. When you rename or remove something, grep this
+  file and `readme.md` for the old name.
+- **`readme.md` is user-facing.** Update it in the same change as any
+  user-visible behaviour, because the About tab renders it.
+- **Commit and push only when asked.** Work on a branch, not `main`.
+
 ## Architecture
 
 - `index.html` — structure + all CSS (no separate stylesheet).
@@ -207,7 +231,7 @@ No build step, no bundler, no npm — everything loads from CDNs
   recovers something, not on the assumption that it might.
 - **Rain, from DMI's radar, not Yr** (`fetch_dmi_radar_pair`,
   `get_radar_composite_pair`, `decode_radar_composite`,
-  `radar_value_at_offset`, all in `server.py`; `fetchVenuePrecipitation`
+  `radar_rain_grid`, `radar_values`, all in `server.py`; `fetchVenuePrecipitation`
   in `app.js`). Yr has no radar product — its Locationforecast API is a
   point forecast, not useful for "is it raining right now, exactly here."
   DMI operates Denmark's actual radar network, so it's the only source
@@ -244,7 +268,7 @@ No build step, no bundler, no npm — everything loads from CDNs
     5-minute steps (13 total), stress-testing the motion model's range on
     request.** Only offset 0 is a true unprojected observation (reads
     curr directly, frac=0) — every other step, negative or positive,
-    goes through `radar_value_at_offset`'s SAME semi-Lagrangian
+    goes through `radar_values`' SAME semi-Lagrangian
     projection from curr along the single motion vector. This is a
     deliberate change from an earlier version where negative offsets
     read the "prev" frame's own raw value directly as a real
@@ -261,20 +285,15 @@ No build step, no bundler, no npm — everything loads from CDNs
     affects motion-estimate quality (too short a gap: noisy velocity from
     500m pixel quantization; too long: assumes linear motion over a
     longer window, risking more error for fast-changing storms).
-  - **`get_radar_nowcast_state()` caches the DECODED frames and motion
-    vector in memory, not just the raw bytes** — without it, every single
-    `/api/precipitation` request re-decoded both HDF5 files and re-ran
-    the FFT motion estimate from scratch, even on a cache HIT, which was
-    real, confirmed, avoidable repeated CPU work (a warm request dropped
-    from ~55ms to ~12ms once this was added) — reported live as "tracing
-    shadows now takes forever" (the loading step that runs right after
-    this fetch, so it read as the slow part even though the actual delay
-    was upstream of it). Keyed by a hash of the raw curr bytes, not
-    identity — `read_cache_bytes` returns a fresh `bytes` object per call
-    even when the underlying file hasn't changed, so `is`/`id()` would
-    never hit. If you touch this path, don't decode/re-estimate motion
-    directly in the route handler again — always go through this
-    function so a cache HIT stays cheap.
+  - **`get_radar_nowcast_state()` caches the DECODED frame, its rain-rate
+    grid and the motion vector in memory, not just the raw bytes.** Without
+    it every `/api/precipitation` request re-decoded HDF5 and re-ran the FFT
+    even on a cache HIT. Keyed by a hash of the raw curr bytes, not identity,
+    because `read_cache(binary=True)` returns a fresh `bytes` object per call.
+    Always go through this function, so a HIT stays cheap.
+    `radar_values` samples the precomputed rain grid with numpy for all
+    venues and offsets at once. Verified to match the old per-point loop
+    exactly (0 mismatches over ~16k point/offset pairs, including NaN cases).
     `estimate_radar_motion(prev, curr)` derives ONE Denmark-wide (dx, dy)
     pixel drift vector via FFT phase correlation on downsampled
     (factor-4) frames — a genuinely approximate technique (one global
@@ -287,7 +306,7 @@ No build step, no bundler, no npm — everything loads from CDNs
     conj(fa)` (not `fa * conj(fb)`, which is backwards) gives the correct
     prev→curr motion direction; getting this backwards would have
     silently predicted rain moving the wrong way with no error to catch
-    it. `radar_value_at_offset` does semi-Lagrangian sampling for any
+    it. `radar_values` does semi-Lagrangian sampling for any
     non-zero offset (past or future) — to predict what's at a fixed
     point at curr's time plus that offset, it reads the CURRENT frame at
     the position upstream (or downstream, for a negative offset) along
@@ -349,8 +368,8 @@ No build step, no bundler, no npm — everything loads from CDNs
     reliably exactly -15 either — reported live as confusing/looking
     broken when a venue's "Now" step showed 17:35 while the user had
     clicked at 17:47. `updateTimelineClockTimes` (`app.js`) computes all
-    4 steps' real times from the radar response alone (`radarTime`/
-    `radarPrevTime`, both already real observation timestamps) — it does
+    4 steps' real times from the radar response alone (`radarTime`,
+    the real observation timestamp) — it does
     NOT use the device's own clock, so the timeline is internally
     consistent with itself and with the per-venue "Radar as of…"/"…
     (nowcast)" labels, even though neither is a promise about your
@@ -383,8 +402,8 @@ No build step, no bundler, no npm — everything loads from CDNs
     different things (no radar coverage there vs. radar looked and found
     nothing), the same "don't invent a value for a missing reading" rule
     `cloudTierState(null)` already follows for cloud cover. If every
-    sampled pixel around a point is `nodata`, `radar_value_at_offset`
-    returns `None`, not `0` — the venue then shows `—` for rain, not "no rain."
+    sampled pixel around a point is `nodata`, `radar_values` returns NaN
+    (serialised as `null`), not `0` — the venue then shows `—` for rain, not "no rain."
   - **The composite's stereographic projection (`_radar_project` in
     server.py) is a spherical approximation, not full WGS84-ellipsoidal**
     — confirmed against the file's own corner coordinates to be accurate
@@ -648,6 +667,16 @@ No build step, no bundler, no npm — everything loads from CDNs
   maps otherwise; `travelmode=walking`/`dirflg=w` default to walking
   directions since these are cafés/bars/restaurants someone's walking to,
   not driving.
+
+- **Building shadows and wind shelter use a per-area bounding-box index**
+  (`indexBuildings` in `app.js`, built once per load and passed into
+  `isVenueShadowed` / `isVenueWindSheltered`). A cheap box-distance test and a
+  box-overlap test reject most buildings before the exact `turf` checks, which
+  alone took shadow tracing from ~730ms to ~160ms across the test areas with
+  identical sun results. The wind check's old pre-filter only looked at each
+  building's first corner and could miss a building whose body was next to the
+  venue, so a few more venues now show as wind-sheltered (111 of 2,014 in the
+  test set, all False→True, each confirmed by an exact intersection test).
 
 ## Testing changes
 

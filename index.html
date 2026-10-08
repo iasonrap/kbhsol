@@ -26,10 +26,8 @@
     --night: #2a3868;
   }
 
-  /* Daytime theme — swapped in automatically while the sun is actually up in
-     Copenhagen (see computeTheme() in app.js). Night/dark stays the default
-     identity; marker state colors (sun/shade/etc.) intentionally don't
-     change here — they're semantic, not thematic. */
+  /* Day theme, applied while the sun is up (computeTheme() in app.js).
+     Marker state colours stay the same in both themes. */
   :root[data-theme="day"] {
     --bg: #eef3f8;
     --bg-deep: #dfe8f0;
@@ -39,8 +37,7 @@
     --line: rgba(20, 40, 60, 0.12);
     --ink: #1c2b3a;
     --ink-dim: #5b6c80;
-    /* The bright night-mode gold reads poorly on this light background —
-       a mid-tone goldenrod balances warmth/saturation with real contrast. */
+    /* Night gold has poor contrast on this light background. */
     --accent: #d4940c;
     --accent-soft: #b8800d;
   }
@@ -78,7 +75,7 @@
   .tab.active { color: var(--accent-ink); background: var(--accent); }
 
   #area-select { flex: 0 0 auto; position: relative; }
-  #area-dropdown-toggle { display: none; } /* desktop: full row of pills stays always-visible below */
+  #area-dropdown-toggle { display: none; } /* phone-only, see the media query */
   #area-bar {
     display: flex; gap: 8px; flex-wrap: wrap;
     background: var(--bg-deep); padding: 12px 20px; border-bottom: 1px solid var(--line);
@@ -121,11 +118,7 @@
     transition: width 0.25s ease, border-radius 0.25s ease;
   }
   #panel-content { padding: 20px 22px; max-height: 78vh; overflow-y: auto; }
-  /* A small tab clipped half outside the panel's right edge — a familiar
-     "collapse rail" handle. Collapsing shrinks #panel itself down to just
-     this button (content is display:none and #panel carries no padding of
-     its own), so with many areas selected pushing the panel tall enough to
-     block the map, one click reduces it to a small circle instead. */
+  /* Collapsing shrinks #panel to just this button. */
   #panel-toggle {
     position: absolute; top: 14px; right: -13px; z-index: 2;
     width: 26px; height: 26px; border-radius: 50%; padding: 0;
@@ -239,7 +232,7 @@
   #about-content a:hover { text-decoration: underline; }
   #about-content hr { border: none; border-top: 1px solid var(--line); margin: 32px 0; }
 
-  /* --- Track tab (API request log + charts) ----------------------------- */
+  /* --- Track tab --------------------------------------------------------- */
   .track-layout { max-width: 1080px; margin: 0 auto; padding: 32px 24px 80px; }
   .track-header h2 {
     font-family: 'Fraunces', serif; font-weight: 600; font-size: 30px; margin: 0 0 8px; color: var(--ink);
@@ -300,7 +293,6 @@
   .track-cache-badge.STALE { background: rgba(212,148,12,0.15); color: #d4940c; }
   .track-cache-badge.ERROR { background: rgba(224,93,93,0.15); color: #e05d5d; }
 
-
   #loading-overlay {
     position: absolute; inset: 0; z-index: 12;
     display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -308,14 +300,10 @@
     transition: opacity 0.5s ease;
   }
   #loading-overlay.fade-out { opacity: 0; pointer-events: none; }
-  #loading-overlay[hidden] { display: none; }
 
   #idle-prompt {
-    /* Fixed dark scrim + fixed light text, deliberately NOT theme tokens —
-       this sits over the map itself (light or dark basemap either way),
-       so it needs to contrast against the map, not follow the chrome
-       palette. Using var(--ink) here was the bug: in the light day theme
-       that resolves to dark text on this same dark scrim — unreadable. */
+    /* Fixed colours, not theme tokens: this sits over the map, and var(--ink)
+       turns dark in the day theme, which would be unreadable on this scrim. */
     position: absolute; inset: 0; z-index: 4;
     display: flex; flex-direction: column; align-items: center; justify-content: center;
     gap: 12px; background: rgba(8,12,22,0.72); color: #f6f1e6; text-align: center;
@@ -441,11 +429,7 @@
   }
   .vd-hours-row.today { color: var(--accent); font-weight: 700; }
 
-  /* --- Navigate-with chooser: a custom bottom sheet, not the OS's native
-     one (a web page can't invoke that — there's no browser API that opens
-     the actual native "choose an app" sheet scoped to just navigation
-     apps), styled to feel like it while staying fully within our control
-     and working the same on every platform, not just iOS. --- */
+  /* --- Navigate-with chooser: a bottom sheet styled like the native one. --- */
   #nav-sheet-backdrop {
     position: fixed; inset: 0; z-index: 10; background: rgba(6,10,19,0.55);
     opacity: 0; transition: opacity 0.2s ease;
@@ -469,17 +453,9 @@
     padding: 14px 12px; cursor: pointer; text-align: center; border-radius: 10px;
   }
   .nav-sheet-btn:first-of-type { border-top: none; }
+  .nav-sheet-btn:hover { background: var(--panel); }
 
-  /* --- Timeline (-10 to +50 min in 5-min steps): scrubs the rain/weather
-     nowcast shown in the area and venue panels, plus a -/+ button on each
-     side to step one increment at a time. Bottom-center fixed overlay,
-     same placement pattern as #nav-sheet above, but a lower z-index — the
-     nav sheet and loading overlay should still win if they're ever open
-     at the same time. Dragging updates live on every pointermove (see
-     app.js), snapped to the nearest step, not just on release — there's
-     still only a fixed set of real data points (see
-     fetchVenuePrecipitation/fetchVenueWeather), just enough of them now
-     that continuous-looking movement during drag reads naturally. --- */
+  /* --- Timeline (-10 to +50 min, 5-min steps). Scrubs the nowcast figures. --- */
   #timeline {
     position: fixed; left: 50%; bottom: 56px; z-index: 9;
     transform: translateX(-50%);
@@ -487,7 +463,6 @@
     border-radius: 16px; padding: 10px 16px 12px; box-shadow: 0 12px 32px rgba(0,0,0,0.4);
     display: flex; flex-direction: column; align-items: center; gap: 6px;
   }
-  #timeline[hidden] { display: none; }
   #timeline-label { font-size: 12px; font-weight: 700; color: var(--ink); }
   .timeline-row { display: flex; align-items: center; gap: 8px; }
   .timeline-step-btn {
@@ -505,10 +480,7 @@
     content: ''; position: absolute; left: 0; right: 0; top: 50%; height: 3px;
     background: var(--line); transform: translateY(-50%); border-radius: 2px;
   }
-  /* 13 light tick marks (one per 5-minute step, -10 to +50) — a visual
-     cue for the step count without 13 separate DOM elements, which
-     wasn't workable as individually clickable targets at this density
-     (see the JS comment by timelineTrackEl's click handler). */
+  /* 13 tick marks, one per step, drawn with a gradient rather than 13 elements. */
   .timeline-track::after {
     content: ''; position: absolute; left: 0; right: 0; top: 50%; height: 5px;
     transform: translateY(-50%);
@@ -526,7 +498,6 @@
     box-shadow: 0 2px 8px rgba(0,0,0,0.45);
   }
   .timeline-handle:active { cursor: grabbing; }
-  .nav-sheet-btn:hover { background: var(--panel); }
   .nav-sheet-cancel { font-weight: 600; color: var(--accent-soft); margin-top: 6px; border-top: none; }
 
   footer {
@@ -542,7 +513,7 @@
   .footer-powered-by { display: inline-flex; align-items: center; gap: 6px; color: var(--accent); }
   .footer-powered-by img { width: 28px; height: 28px; }
 
-  /* MapLibre default controls, restyled to match the floating glass language */
+  /* MapLibre's default controls, restyled to match the glass panels. */
   .maplibregl-ctrl-group {
     background: var(--panel) !important; backdrop-filter: blur(14px);
     border: 1px solid var(--line) !important; border-radius: 999px !important;
@@ -559,30 +530,18 @@
   .maplibregl-popup-tip { border-top-color: var(--panel-solid) !important; border-bottom-color: var(--panel-solid) !important; }
 
   /* --- Phone layout ------------------------------------------------------
-     Deliberately placed at the very end of the stylesheet, after every base
-     rule it overrides (#venue-detail, footer, etc.) — CSS resolves ties by
-     source order, so a media-query override placed *earlier* than the base
-     rule it's meant to override loses to it regardless of viewport width.
-     (Confirmed the hard way: an earlier version of this block sat inside
-     the About-tab's @media block further up the file, and #venue-detail's
-     width:100% override was silently losing to the later width:320px base
-     rule — the drawer only ever rendered ~320px wide even on a 390px-wide
-     screen, an easy mistake to make and easy to miss without an actual
-     screenshot at that width, not just resizing a desktop browser.) */
+     Keep this block at the end of the stylesheet. Source order decides ties,
+     so an override placed earlier loses to the base rule it targets. Check
+     changes at 390px and 320px wide. */
   @media (max-width: 700px) {
-    /* Header: Københavns Sol top-left, Map/About/Track top-right, both
-       shrunk enough to actually fit together on a phone-width header. */
+    /* Header: shrunk so the title and tabs fit on one line. */
     header { padding: 0 12px; gap: 8px; height: 50px; }
     header h1 { font-size: 15px; }
     .tabs { gap: 2px; padding: 3px; }
     .tab { padding: 6px 10px; font-size: 11.5px; }
     .theme-toggle { width: 20px; height: 20px; }
 
-    /* Area selection becomes a dropdown: a single "Select areas" trigger
-       that expands into the same multi-select pill list, stacked
-       full-width and scrollable, instead of permanently occupying a row
-       under the header. Desktop keeps the always-visible pill row
-       (#area-dropdown-toggle stays display:none there). */
+    /* Area selection: a dropdown trigger that expands into the pill list. */
     #area-dropdown-toggle {
       display: flex; align-items: center; justify-content: space-between; width: 100%;
       font-family: inherit; background: var(--bg-deep); border: none; color: var(--ink);
@@ -600,45 +559,25 @@
     #area-bar.open { display: flex; }
     .area-box { width: 100%; text-align: left; padding: 11px 16px; }
 
-    /* Map overlays: full-width stats panel instead of a fixed 260px box,
-       and a full-width venue detail drawer instead of a partial
-       right-hand sidebar — both read as cramped sidebars on a phone. */
+    /* Full-width stats panel and venue drawer. */
     #panel { left: 10px; right: 10px; top: 10px; width: auto; }
     #panel.collapsed { width: 40px; right: auto; }
     #panel-content { max-height: 60vh; padding: 16px 18px; }
-    /* The toggle tab sits at the panel's right edge on desktop, which on a
-       phone lands right under MapLibre's zoom +/-/compass control (also
-       top-right) — confirmed live, the two visually collided. Left edge is
-       clear at every width the panel can be, collapsed or not. */
+    /* Left edge: on the right it collides with MapLibre's zoom controls. */
     #panel-toggle { left: -13px; right: auto; }
     .hero-stats { gap: 16px; }
     .hero-stat .num { font-size: 26px; }
     #venue-detail { width: 100%; max-width: 100%; }
 
-    /* Footer: same pieces, tighter spacing so they don't wrap awkwardly at
-       phone width. The GitHub repo URL text is dropped (icon + link stay)
-       since there isn't room for the icon, "powered by" + exeo logo, and
-       "Built with Claude" plus the full URL all on one line at phone width. */
+    /* Footer: the GitHub URL text is hidden; the icon link stays. */
     footer { padding: 8px 12px; font-size: 11px; gap: 8px; }
     .footer-gh-url { display: none; }
     .footer-powered-by { gap: 4px; }
     .footer-powered-by img { width: 20px; height: 20px; }
     .footer-right { gap: 8px; }
 
-    /* --- About page ------------------------------------------------------
-       The desktop About page is a deliberate "Apple product page" effect:
-       each ## section is forced to fill a full viewport-height slide
-       (sizeChapters() in app.js sets min-height inline) and fades in via
-       scroll-snap. That's a nice desktop touch and a bad mobile fit — most
-       chapters don't have a full screen's worth of content at phone width,
-       so it read as mostly empty space with a barely-visible ghost of the
-       next section peeking in, which is what "doesn't look very responsive"
-       actually was. Below, that effect is switched off entirely on mobile
-       (the min-height/opacity JS sets inline styles, so !important is what
-       it takes to override them from a stylesheet) in favor of a normal,
-       continuously-flowing article — better content density, no dead
-       space, still tracks reading position in the TOC via the same
-       IntersectionObserver (that part isn't height-dependent). */
+    /* --- About page: the full-height desktop slides are off on phones.
+       sizeChapters() sets min-height inline, so !important is needed. */
     .about-layout { flex-direction: column; padding-top: 0; gap: 0; }
     #about-view { scroll-snap-type: none; }
     .chapter {
@@ -647,20 +586,9 @@
     }
     .chapter-intro { padding-top: 8px; }
 
-    /* TOC becomes a horizontal row of tappable pill chips, sticky under the
-       header, with a soft fade at the trailing edge hinting there's more
-       to scroll — matches the pill language used everywhere else in the
-       app (tabs, area selector) instead of the desktop sidebar's
-       underline-and-snippet treatment, which has no room to work at this
-       width. */
+    /* TOC: a horizontal row of pill chips. */
     #toc {
-      /* flex:0 0 210px in the base rule sizes the desktop sidebar's WIDTH
-         (.about-layout is a row there) — .about-layout flips to a column
-         below, which flips flex-basis to the vertical axis too, so that
-         same 210px silently became this bar's *height* instead of doing
-         nothing. Confirmed live: #toc rendered 231px tall with its pills
-         vertically centered in all that empty space. flex:0 0 auto lets
-         it size to its own content again. */
+      /* Resets the desktop flex-basis (210px), which would otherwise size the height. */
       flex: 0 0 auto;
       position: sticky; top: 0; z-index: 2; flex-direction: row; align-items: center; width: 100%;
       overflow-x: auto; background: var(--bg); padding: 10px 14px;
@@ -674,18 +602,10 @@
       border-radius: 999px; padding: 7px 14px; font-size: 12.5px;
     }
     .toc-item.active { border-left: none; border-color: var(--accent); background: var(--accent); color: var(--accent-ink); }
-    /* Must match (or beat) .toc-item.active .toc-snippet's specificity —
-       a plain .toc-item .toc-snippet {display:none} here loses to that
-       3-class rule regardless of source order, which was a real, visible
-       bug: the active chip's snippet stayed expanded and flexbox's default
-       align-items:stretch then puffed up every *other* chip in the row to
-       match its height, turning the whole TOC into tall capsules instead
-       of flat pills. */
+    /* Also matches the active chip, or its snippet stretches the whole row. */
     .toc-item .toc-snippet, .toc-item.active .toc-snippet { display: none; }
 
-    /* Typography scaled down for phone reading, with chapter spacing
-       tightened now that chapters flow naturally instead of each
-       commanding a full screen. */
+    /* Phone reading sizes. */
     #about-content { padding: 22px 16px 72px; font-size: 14.5px; line-height: 1.65; }
     #about-content h1 { font-size: 25px; padding-bottom: 10px; }
     #about-content h1 + p { font-size: 15px; }
@@ -693,11 +613,7 @@
     #about-content pre { padding: 12px; font-size: 12.5px; }
     .track-layout { padding: 20px 16px 60px; }
 
-    /* Raised higher than the desktop bottom offset — MapLibre's own
-       bottom-right attribution/info control sits at roughly the same
-       height as the desktop position, and on a narrow phone screen the
-       timeline spans close enough to that corner to visibly overlap it
-       (confirmed live via a real device screenshot, not just a resize). */
+    /* Raised so it clears MapLibre's attribution control in the bottom-right. */
     #timeline { bottom: 88px; }
 </style>
 </head>

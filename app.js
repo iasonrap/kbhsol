@@ -48,10 +48,7 @@ function areaCenter(bbox) {
   return [(bbox.west + bbox.east) / 2, (bbox.south + bbox.north) / 2];
 }
 
-// Cloud cover (0-100 scale) tiers, from clearest to most overcast. Sourced
-// from Yr/MET Norway's cloud_area_fraction now, not DMI's — same proven
-// thresholds carried over unchanged, since this is a direct parameter swap
-// (both are "% of sky covered"), not a new metric needing new tuning.
+// Cloud cover (0-100, Yr's cloud_area_fraction) tiers, clearest to most overcast.
 const CLOUD_TIERS = [
   { max: 10, state: 'sun' },
   { max: 30, state: 'partly-sunny' },
@@ -60,12 +57,7 @@ const CLOUD_TIERS = [
 ];
 
 function cloudTierState(cloudCover) {
-  // A failed/missing weather fetch must NOT be treated as clear sky — that
-  // would silently mislabel venues as sunny whenever the upstream call
-  // failed for their grid cell. Surface it as its own "unknown" state
-  // instead of guessing (a real, confirmed bug the first time this logic
-  // was written, back when it was DMI-backed — the lesson carries over
-  // regardless of which API is behind it).
+  // A missing reading must never look like clear sky. Show it as "unknown".
   if (cloudCover == null) return 'unknown';
   return CLOUD_TIERS.find(tier => cloudCover < tier.max).state;
 }
@@ -75,11 +67,7 @@ const panel = document.getElementById('panel');
 const panelContent = document.getElementById('panel-content');
 const panelToggle = document.getElementById('panel-toggle');
 
-// Collapse state is deliberately kept on the persistent #panel-toggle button
-// rather than rebuilt inside renderPanel()'s innerHTML — that function reruns
-// on every area load/unload, and if the collapse toggle lived inside the
-// HTML it replaces, collapsing the panel would silently un-collapse itself
-// the next time any area's data refreshed.
+// Lives outside renderPanel()'s innerHTML, which is rewritten on every load.
 panelToggle.addEventListener('click', () => {
   const collapsed = panel.classList.toggle('collapsed');
   panelToggle.textContent = collapsed ? '›' : '‹';
@@ -202,15 +190,8 @@ document.querySelector('[data-view="about"]').addEventListener('click', async ()
 });
 
 // --- Track tab (API request log + charts) --------------------------------
-//
-// Every proxied request server.py makes (Overpass venues/buildings, Yr
-// weather tiles) is logged server-side to data/api_log.jsonl regardless of
-// whether it was a cache hit — this tab visualizes that log so it's
-// obvious whether the caching/grid-snapping design is actually working, or
-// if something's quietly spamming an upstream API. Only two kinds now
-// ('overpass', 'weather') — DMI's old split between a forecast-per-tile
-// call and an observation-per-station call collapsed into one Yr call per
-// grid cell, so there's one weather chart instead of two.
+// Visualises data/api_log.jsonl (every proxied call, hit or miss), so cache
+// behaviour and accidental upstream spam are visible.
 
 const TRACK_PALETTE = ['#ffd166', '#5e96e0', '#c76dd6', '#4caf7d', '#e0955e', '#7ad1c9', '#e05d8d', '#a3a86c'];
 
@@ -527,11 +508,8 @@ function overpassVenuesToGeoJSON(data) {
 
 // --- Yr (MET Norway) weather -------------------------------------------
 
-// Must match server.py's WEATHER_GRID_*_STEP — kept in sync by hand since
-// there's no shared config file. The server re-snaps anyway (it's the
-// authority on cache keys), but snapping client-side first means an area's
-// worth of venues collapses into one fetch per distinct cell instead of one
-// per venue, before any request is even sent.
+// Must match server.py's WEATHER_GRID_*_STEP (no shared config). Snapping here
+// means one fetch per distinct cell, not one per venue.
 const WEATHER_GRID_LAT_STEP = 0.018;
 const WEATHER_GRID_LON_STEP = 0.032;
 
@@ -541,16 +519,7 @@ function weatherGridCell(lon, lat) {
   return { key: `${snappedLat.toFixed(4)},${snappedLon.toFixed(4)}`, lat: snappedLat, lon: snappedLon };
 }
 
-// The 3-stop timeline (Now / +15 / +30) shared by both weather and radar —
-// must match server.py's RADAR_NOWCAST_OFFSETS_MINUTES so a client-picked
-// step index lines up with the same offset the server computed. There's no
-// shared config file, same as the weather grid steps below; if you change
-// one, change the other.
-// -10 to +50 in 5-minute steps — only 0 is a true unprojected observation
-// now; every other step (negative or positive) is the same motion-vector
-// projection from the current radar frame, just with a smaller/larger
-// time offset (see radar_value_at_offset in server.py). Must match
-// server.py's RADAR_NOWCAST_OFFSETS_MINUTES.
+// Timeline steps, -10 to +50 min. Must match RADAR_NOWCAST_OFFSETS_MINUTES in server.py.
 const TIMELINE_OFFSETS_MINUTES = [];
 for (let m = -10; m <= 50; m += 5) TIMELINE_OFFSETS_MINUTES.push(m);
 
@@ -605,16 +574,9 @@ async function fetchYrWeather(cell) {
   }
 }
 
-// Weather (temp/wind/cloud together) is read at each venue's own coordinate
-// (snapped to a shared ~2km grid) rather than once at the area's center —
-// a venue near an area's edge can genuinely sit in a different weather cell
-// than its own area's center (e.g. an Østerbro café close to the Nordhavn
-// border), so sharing one area-wide reading across every venue was giving
-// edge venues the wrong numbers. Venues are grouped by grid cell first, so
-// this is one fetch per distinct cell actually in play, not one per venue —
-// and, since Yr's Locationforecast API bundles temp/wind/cloud into one
-// response, one fetch covers all three at once, not three separate calls
-// per cell the way DMI's split observation/forecast APIs needed.
+// Weather is read per venue's grid cell, not once per area: venues near an
+// area edge can sit in a different cell than the area centre. One fetch per
+// distinct cell covers temp, wind and cloud together.
 async function fetchVenueWeather(venues) {
   const cells = new Map(); // cellKey -> { key, lat, lon }
   for (const f of venues.features) {
@@ -654,15 +616,8 @@ async function fetchVenueWeather(venues) {
 }
 
 // --- DMI radar (precipitation) ------------------------------------------
-//
-// A different shape from fetchVenueWeather above: there's only one radar
-// composite covering all of Denmark at a time (server.py caches it once,
-// not per grid cell), so this sends every venue's own exact coordinate in
-// a single bulk POST rather than snapping to a shared grid first — the
-// per-point cost on the server is just an array lookup against whichever
-// composite is already cached, not a new upstream request per point, so
-// there's nothing to gain from deduping venues into cells the way weather
-// does.
+// One Denmark-wide composite, so every venue's exact coordinate goes in one
+// bulk POST. The server answers each point with a cheap array lookup.
 async function fetchVenuePrecipitation(venues) {
   const points = venues.features.map(f => {
     const [lon, lat] = f.geometry.coordinates;
@@ -707,12 +662,7 @@ async function fetchVenuePrecipitation(venues) {
   }
 }
 
-// Circular mean, not a plain arithmetic average — wind direction wraps at
-// 360°, so naively averaging e.g. 350° and 10° gives 180° (due south, the
-// exact opposite of correct) instead of 0° (due north, the right answer).
-// Averaged over each distinct grid cell's own reading, for the area-wide
-// summary shown in the top panel — a venue's own detail panel still shows
-// its own cell's un-averaged direction.
+// Circular mean: a plain average of 350° and 10° would give 180°, not 0°.
 function circularMeanDegrees(degrees) {
   if (!degrees.length) return null;
   let sinSum = 0, cosSum = 0;
@@ -839,18 +789,60 @@ function getSunInfo(lat, lon) {
 
 // --- Shadow calc ----------------------------------------------------------
 
-function isVenueShadowed(venueCoord, buildings, bearingDeg, altitudeRad) {
+// Buildings are indexed once per area with their bounding boxes. Per-venue
+// checks can then reject far-away buildings with arithmetic, instead of a
+// turf.distance call for every venue x building pair.
+function indexBuildings(buildings) {
+  return buildings.features.map(feature => {
+    let minLon = Infinity, minLat = Infinity, maxLon = -Infinity, maxLat = -Infinity;
+    for (const ring of feature.geometry.coordinates) {
+      for (const [lon, lat] of ring) {
+        if (lon < minLon) minLon = lon;
+        if (lon > maxLon) maxLon = lon;
+        if (lat < minLat) minLat = lat;
+        if (lat > maxLat) maxLat = lat;
+      }
+    }
+    return { feature, minLon, minLat, maxLon, maxLat };
+  });
+}
+
+// Approximate metres from a point to a box. Accurate enough for a pre-filter
+// with a 1.5x margin; the exact turf checks still decide.
+function metresToBox(lon, lat, box) {
+  const dLat = lat < box.minLat ? box.minLat - lat : lat > box.maxLat ? lat - box.maxLat : 0;
+  const dLon = lon < box.minLon ? box.minLon - lon : lon > box.maxLon ? lon - box.maxLon : 0;
+  const mPerDegLat = 111320;
+  const mPerDegLon = mPerDegLat * Math.cos(lat * Math.PI / 180);
+  return Math.hypot(dLat * mPerDegLat, dLon * mPerDegLon);
+}
+
+// A segment can only touch a building if their bounding boxes overlap, so this
+// rejects most candidates before the exact turf check.
+function segmentBox(a, b) {
+  return {
+    minLon: Math.min(a[0], b[0]), maxLon: Math.max(a[0], b[0]),
+    minLat: Math.min(a[1], b[1]), maxLat: Math.max(a[1], b[1])
+  };
+}
+
+function boxesOverlap(a, b) {
+  return a.minLon <= b.maxLon && a.maxLon >= b.minLon && a.minLat <= b.maxLat && a.maxLat >= b.minLat;
+}
+
+function isVenueShadowed(venueCoord, buildingIndex, bearingDeg, altitudeRad) {
   const end = turf.destination(venueCoord, SHADOW_RAY_METERS / 1000, bearingDeg, { units: 'kilometers' }).geometry.coordinates;
   const ray = turf.lineString([venueCoord, end]);
+  const rayBox = segmentBox(venueCoord, end);
+  const [lon, lat] = venueCoord;
 
-  for (const building of buildings.features) {
-    // Cheap pre-filter: skip buildings clearly too far to matter before running exact geometry checks.
-    const approxCoord = building.geometry.coordinates[0][0];
-    if (turf.distance(venueCoord, approxCoord, { units: 'meters' }) > SHADOW_RAY_METERS * 1.5) continue;
+  for (const entry of buildingIndex) {
+    if (metresToBox(lon, lat, entry) > SHADOW_RAY_METERS * 1.5) continue;
+    if (!boxesOverlap(rayBox, entry)) continue;
+    const building = entry.feature;
     if (!turf.booleanIntersects(ray, building)) continue;
 
-    const line = turf.polygonToLine(building);
-    const intersections = turf.lineIntersect(ray, line);
+    const intersections = turf.lineIntersect(ray, turf.polygonToLine(building));
     if (!intersections.features.length) continue;
 
     let minDist = Infinity;
@@ -869,20 +861,20 @@ function isVenueShadowed(venueCoord, buildings, bearingDeg, altitudeRad) {
 const WIND_SHELTER_RAY_METERS = 40; // buildings further than this don't meaningfully block wind at ground level
 const WIND_SHELTER_MIN_HEIGHT = 3;  // ignore trivially low structures (walls, sheds)
 
-// Unlike sun shadow (an angle-above-horizon problem), wind at street level is
-// blocked by any building of reasonable height standing directly upwind and
-// close by — no altitude trigonometry needed, just proximity + a height floor.
-function isVenueWindSheltered(venueCoord, buildings, windDirDeg) {
-  // windDir is the compass direction the wind is blowing FROM, so the
-  // sheltering building sits in that same direction from the venue.
+// Wind at street level is blocked by a building of reasonable height standing
+// close upwind, so this is a proximity check, not an altitude calculation.
+function isVenueWindSheltered(venueCoord, buildingIndex, windDirDeg) {
+  // windDir is where the wind comes FROM, so the blocker sits in that direction.
   const end = turf.destination(venueCoord, WIND_SHELTER_RAY_METERS / 1000, windDirDeg, { units: 'kilometers' }).geometry.coordinates;
   const ray = turf.lineString([venueCoord, end]);
+  const rayBox = segmentBox(venueCoord, end);
+  const [lon, lat] = venueCoord;
 
-  for (const building of buildings.features) {
-    if (building.properties.height < WIND_SHELTER_MIN_HEIGHT) continue;
-    const approxCoord = building.geometry.coordinates[0][0];
-    if (turf.distance(venueCoord, approxCoord, { units: 'meters' }) > WIND_SHELTER_RAY_METERS * 1.5) continue;
-    if (turf.booleanIntersects(ray, building)) return true;
+  for (const entry of buildingIndex) {
+    if (entry.feature.properties.height < WIND_SHELTER_MIN_HEIGHT) continue;
+    if (metresToBox(lon, lat, entry) > WIND_SHELTER_RAY_METERS * 1.5) continue;
+    if (!boxesOverlap(rayBox, entry)) continue;
+    if (turf.booleanIntersects(ray, entry.feature)) return true;
   }
   return false;
 }
@@ -892,12 +884,8 @@ function isVenueWindSheltered(venueCoord, buildings, windDirDeg) {
 const COPENHAGEN_CENTER = [12.57, 55.685];
 
 // --- Day / night theme --------------------------------------------------
-//
-// The app's dark theme is the default identity ("if it's after sunset the
-// site remains as it is now"). During actual daylight in Copenhagen, the
-// UI chrome and base map switch to a light grey/baby-blue theme instead.
-// Venue marker colors (sun/shade states) stay the same in both — they're
-// semantic, not thematic.
+// Dark is the default. Light applies in daylight. Marker colours are semantic
+// and stay the same in both themes.
 
 const MAP_STYLES = {
   night: 'https://tiles.openfreemap.org/styles/dark',
@@ -905,15 +893,8 @@ const MAP_STYLES = {
 };
 const BUILDING_COLOR = { night: '#151f33', day: '#c3ccd9' };
 
-// Switches at civil twilight (sun 6° below the horizon), not at geometric
-// sunrise/sunset (0°) — Copenhagen's flat terrain and open horizon mean
-// there's still real ambient daylight for a while after the sun's actual
-// altitude crosses 0°, so a 0° threshold made the dark theme kick in
-// while it visibly still looked light outside. This single threshold
-// gives a buffer on both ends for free: day theme now starts ~20-30
-// minutes before actual sunrise and lasts ~20-30 minutes past actual
-// sunset (varies by season/day length), matching perceived daylight
-// more closely than the geometric horizon does.
+// Civil twilight (sun 6° below the horizon), not 0°: the open terrain keeps it
+// looking light well after the sun crosses the horizon.
 const CIVIL_TWILIGHT_ALTITUDE_RAD = -6 * (Math.PI / 180);
 
 function computeTheme() {
@@ -946,7 +927,6 @@ const mapReady = new Promise(resolve => {
 
 const idlePrompt = document.getElementById('idle-prompt');
 const loadingOverlay = document.getElementById('loading-overlay');
-const loadingText = document.getElementById('loading-text');
 
 function resetLoadingSteps() {
   loadingOverlay.innerHTML = `
@@ -1006,16 +986,9 @@ const popup = new maplibregl.Popup({ closeButton: false, offset: 10 });
 const loadedAreas = {}; // areaId -> { venues, counts }
 let pendingLoads = 0;
 
-// --- Timeline (Now / +15 / +30) -----------------------------------------
-//
-// Global, not per-area (confirmed with the user) — one control scrubs the
-// displayed weather/rain figures for every loaded area and the currently
-// open venue panel at once. Only the NUMBERS shown scrub; venue marker
-// colors and the sun/shade state stay pinned to "now" (computed once in
-// loadArea), same as the map's building shadows — a deliberate scope
-// decision, not a missing feature, since +15/+30 min sun position and
-// building shadows would need their own recomputation to do properly and
-// weren't asked for.
+// --- Timeline -----------------------------------------------------------
+// One control scrubs the numbers (weather, rain) for every loaded area. Marker
+// colours and sun/shade stay pinned to "now" by design.
 let timelineOffsetMinutes = 0;
 
 function timelineStepIndex() {
@@ -1115,12 +1088,7 @@ function addAreaLayers(areaId, buildings, venues) {
 }
 
 // --- Venue detail panel -----------------------------------------------
-//
-// Venue fields (name, cuisine, phone, website, wheelchair, opening_hours)
-// come from OpenStreetMap, which anyone can edit — treat them as untrusted
-// input. Every one of them gets HTML-escaped before going into innerHTML,
-// and website/phone links are additionally scheme-validated, so a
-// vandalized OSM entry can't run script in a visitor's browser.
+// OSM fields are untrusted: escape everything, and validate link schemes.
 
 function escapeHtml(str) {
   return String(str)
@@ -1164,13 +1132,8 @@ function formatWeatherValue(value, unit, decimals = 0) {
   return value == null ? '—' : `${value.toFixed(decimals)}${unit}`;
 }
 
-// Yr's symbol_code (e.g. "partlycloudy_day", "lightrainshowers_night") is
-// MET Norway's own human-facing "how does this look" classification —
-// shown as a bonus label next to the numeric weather tiles, not used to
-// drive sun/shade tiering (cloudCover still does that). Covers the common
-// Danish weather categories explicitly; anything unmapped (heavier
-// precipitation/thunder variants, mostly) falls back to a generic icon and
-// the code's own words spaced out, rather than silently showing nothing.
+// Yr's symbol_code for display only. Sun/shade tiering uses cloudCover.
+// Unmapped codes fall back to the code's own words, not blank.
 const SYMBOL_INFO = {
   clearsky: { icon: '☀️', label: 'Clear sky' },
   fair: { icon: '🌤️', label: 'Fair' },
@@ -1199,17 +1162,7 @@ function formatSymbolCode(code) {
   return { icon: '🌡️', label: base.charAt(0).toUpperCase() + base.slice(1) };
 }
 
-// Temp/wind/cloud all come from one Yr call per venue's grid cell now (see
-// fetchVenueWeather) — DMI used to split these across two APIs that failed
-// independently, which is why this used to show two separate stale notes.
-// One combined source now means one flag/note is the correct, simpler
-// behavior for THIS source, not a regression — no news is fresh news, same
-// as everywhere else stale-cache warnings show up in this app.
-// Precipitation (DMI radar) is a separate upstream with its own cache and
-// failure mode, so it gets its own independent note rather than being
-// folded into weatherStale — exactly the same reasoning that used to give
-// forecastStale/obsStale two notes back when DMI split cloud cover and
-// temp/wind across two calls.
+// Weather (Yr) and rain (DMI radar) fail independently, so each gets its own note.
 function renderStaleNotes(weather) {
   let html = '';
   if (weather.weatherStale) {
@@ -1222,13 +1175,8 @@ function renderStaleNotes(weather) {
 }
 
 // --- Opening hours (best-effort OSM `opening_hours` parser) ------------
-//
-// OSM's opening_hours syntax is notoriously irregular in the wild — tested
-// against ~1,270 distinct real values pulled from Copenhagen venues, this
-// parser handles ~97% of them. The rest (seasonal month ranges, "easter"
-// relative dates, week-number rules, nth-weekday selectors like "Fr[1]",
-// free-text comments) are intentionally left unparsed rather than guessed
-// at wrong — the caller falls back to showing OSM's raw text for those.
+// Covers the common forms. Anything unparsed (seasonal ranges, "easter",
+// nth-weekday rules, free text) falls back to the raw OSM string, not a guess.
 
 const DAY_CODES = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'];
 const DAY_NAMES = { Mo: 'Monday', Tu: 'Tuesday', We: 'Wednesday', Th: 'Thursday', Fr: 'Friday', Sa: 'Saturday', Su: 'Sunday' };
@@ -1266,10 +1214,7 @@ function normalizeOpeningTime(raw) {
   return null;
 }
 
-// Parses one ';'-separated clause (e.g. "Sa,Su 07:00-17:00" or a comma-chained
-// run like "09:00-24:00, Fr-Sa 09:00-02:00, Su off") by walking comma-split
-// tokens and buffering bare day tokens (e.g. "Sa" in "Sa,Su 07:00-17:00")
-// until a token with an attached time completes the day list.
+// Parses one ';'-separated clause. Bare day tokens are buffered until a time completes them.
 function parseOpeningRule(rule, result) {
   const tokens = rule.split(',').map(t => t.trim()).filter(Boolean);
   let pendingDays = [];
@@ -1494,12 +1439,7 @@ function openVenueDetail(feature) {
 }
 
 // --- "Navigate with..." chooser --------------------------------------------
-//
-// There's no browser API that opens the OS's actual native "choose a
-// navigation app" sheet — that's a native-app-only feature (MKMapItem /
-// Intent chooser). This is our own bottom sheet built to feel like it,
-// offering the two map apps people actually have, rather than trying (and
-// failing) to fake the real one.
+// Browsers can't open the native app picker, so this is our own sheet.
 let navTargetCoords = null;
 const navSheet = document.getElementById('nav-sheet');
 const navSheetBackdrop = document.getElementById('nav-sheet-backdrop');
@@ -1549,23 +1489,13 @@ const timelineHandleEl = document.querySelector('.timeline-handle');
 const timelineLabelEl = document.getElementById('timeline-label');
 const timelinePrevBtn = document.getElementById('timeline-prev');
 const timelineNextBtn = document.getElementById('timeline-next');
-// Fallback only, shown before any area has loaded (the timeline itself is
-// hidden then anyway — see renderPanel) — real clock times always replace
-// this once radar data is in, per an explicit design call: relative
-// labels ("-15 min"/"Now"/etc.) implied a precision relative to *your*
-// clock that the data doesn't actually have. DMI's radar composite lags
-// real time by ~8-12 minutes on its own (confirmed live — see
-// RADAR_CACHE_TTL_SECONDS in server.py), so "Now" showing a clock time
-// from several minutes ago is honest, not a bug; a generic "Now" label
-// papered over that gap in a way that read as broken instead.
+// Shown only before radar data arrives. Real clock times replace it, since
+// the radar lags real time by several minutes.
 function timelineFallbackLabel(offset) {
   if (offset === 0) return 'Now';
   return offset > 0 ? `+${offset} min` : `${offset} min`;
 }
-// offset -> Date, populated from the radar response in loadArea. The
-// radar composite is one shared Denmark-wide file (not per-area), so
-// these clock times are the same regardless of which loaded area last
-// updated them — there's only ever one "current" radar frame in play.
+// offset -> Date, from the radar response. One shared frame, so one set of times.
 let timelineClockTimes = {};
 
 function timelinePercentForOffset(offset) {
@@ -1578,13 +1508,7 @@ function timelineClockLabel(offset) {
   return d ? d.toLocaleTimeString('da-DK', { hour: '2-digit', minute: '2-digit' }) : timelineFallbackLabel(offset);
 }
 
-// Updates every step's real clock time from the latest radar fetch —
-// radarTime is the "curr" frame's own actual observation time (see
-// fetchVenuePrecipitation); every step is labeled relative to radarTime
-// (the nowcast's own baseline), not device time, since that's what the
-// underlying prediction is actually anchored to. Only the 0 step is a
-// true observation; every other step (negative or positive) is a
-// projection, but all get a real clock label either way.
+// Labels are anchored to the radar frame's own time, not the device clock.
 function updateTimelineClockTimes(radarTimeIso) {
   if (!radarTimeIso) return;
   const radarTime = new Date(radarTimeIso);
@@ -1606,10 +1530,7 @@ function renderTimelinePosition() {
   timelineNextBtn.disabled = idx >= TIMELINE_OFFSETS_MINUTES.length - 1;
 }
 
-// Re-renders whatever's currently on screen for the newly-picked step —
-// all 3 steps were already fetched up front in loadArea (see
-// fetchVenueWeather/fetchVenuePrecipitation), so this never makes a new
-// network request, just picks a different already-downloaded value.
+// All steps are fetched up front, so this only re-renders. No network.
 function setTimelineOffset(minutes) {
   if (timelineOffsetMinutes === minutes) return;
   timelineOffsetMinutes = minutes;
@@ -1635,21 +1556,13 @@ function stepTimeline(direction) {
 timelinePrevBtn.addEventListener('click', () => stepTimeline(-1));
 timelineNextBtn.addEventListener('click', () => stepTimeline(1));
 
-// No individual stop dots any more — 13 steps is too many to render as
-// discrete clickable targets usefully (see TIMELINE_OFFSETS_MINUTES).
-// Clicking anywhere on the track jumps to whichever step is nearest the
-// click; dragging the handle (below) does the same continuously.
+// Clicking the track jumps to the nearest step. Dragging the handle does the same.
 timelineTrackEl.addEventListener('click', e => {
   if (e.target === timelineHandleEl) return;
   setTimelineOffset(timelineOffsetForClientX(e.clientX));
 });
 
-// Dragging the handle updates the label/data live, snapped to the
-// nearest step, on every pointermove — not just on release — so sliding
-// left/right shows exactly where you'll land the whole time, not only
-// after letting go. setTimelineOffset already no-ops when the step
-// hasn't changed, so this doesn't re-render on every pixel of movement,
-// only when the snapped step actually changes.
+// Updates live on every move; setTimelineOffset no-ops when the step is unchanged.
 let timelineDragging = false;
 timelineHandleEl.addEventListener('pointerdown', e => {
   timelineDragging = true;
@@ -1805,12 +1718,13 @@ async function loadArea(areaId) {
     };
   });
 
+  const buildingIndex = indexBuildings(buildings);
   for (const f of venues.features) {
     const cloudTier = cloudTierState(f.properties.cloudCover);
     let state;
     if (!sunIsUp) {
       state = 'night';
-    } else if (isVenueShadowed(f.geometry.coordinates, buildings, sun.bearingDeg, sun.altitudeRad)) {
+    } else if (isVenueShadowed(f.geometry.coordinates, buildingIndex, sun.bearingDeg, sun.altitudeRad)) {
       state = 'building-shade';
     } else {
       state = cloudTier;
@@ -1821,7 +1735,7 @@ async function loadArea(areaId) {
     // same per-venue-accuracy upgrade cloud cover already got, made free by
     // Yr bundling wind into the same per-cell response.
     f.properties.windSheltered = f.properties.windDir != null
-      ? isVenueWindSheltered(f.geometry.coordinates, buildings, f.properties.windDir)
+      ? isVenueWindSheltered(f.geometry.coordinates, buildingIndex, f.properties.windDir)
       : false;
   }
   markStepDone('shadows');
@@ -1900,10 +1814,7 @@ themeToggle.addEventListener('click', () => {
   updateThemeToggleIcon();
 });
 
-// On phone widths #area-bar becomes a collapsible dropdown (see the mobile
-// media query in index.html) — desktop ignores all of this since
-// #area-dropdown-toggle stays display:none there, and .open never gets
-// added by anything but this click handler.
+// Phone-only dropdown. On desktop the toggle is hidden and never opened.
 const areaDropdownToggle = document.getElementById('area-dropdown-toggle');
 const areaDropdownLabel = document.getElementById('area-dropdown-label');
 const areaBarEl = document.getElementById('area-bar');
